@@ -2,7 +2,9 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
-import matplotlib.patches as mpatches
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 # --- Core Mathematical Logic ---
 
@@ -53,6 +55,133 @@ def solve_newton(initial_guess, p, n, m, tolerance=1e-6, max_iter=50):
         v = v + delta
         history.append(v.copy())
     return v, np.array(history), errors
+
+
+# --- Physics-Informed Neural Network Logic ---
+
+class PINN(nn.Module):
+    """Neural network that learns the positive concentrations G(t) and P(t)."""
+
+    def __init__(self, t_end, hidden_layers=3, neurons=32):
+        super().__init__()
+        self.t_end = max(float(t_end), 1e-6)
+
+        layers = [nn.Linear(1, neurons), nn.Tanh()]
+        for _ in range(hidden_layers - 1):
+            layers.extend([nn.Linear(neurons, neurons), nn.Tanh()])
+        layers.append(nn.Linear(neurons, 2))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, t):
+        # Normalization keeps the network input in a training-friendly range.
+        normalized_t = 2.0 * t / self.t_end - 1.0
+        return F.softplus(self.network(normalized_t)) + 1e-6
+
+
+def torch_ode_rhs(G, P, p, n, m):
+    """Torch version of the governing equations used in the PINN loss."""
+    g_activation = p['a1'] * G.pow(n) / (p['tha1']**n + G.pow(n))
+    g_inhibition = (
+        p['b1'] * p['thb1']**m
+        / (p['thb1']**m + G.pow(m) * P.pow(m))
+    )
+    p_activation = p['a2'] * P.pow(n) / (p['tha2']**n + P.pow(n))
+    p_inhibition = (
+        p['b2'] * p['thb2']**m
+        / (p['thb2']**m + G.pow(m) * P.pow(m))
+    )
+    return (
+        g_activation + g_inhibition - p['k1'] * G,
+        p_activation + p_inhibition - p['k2'] * P,
+    )
+
+
+def calculate_pinn_loss(
+    model,
+    collocation_t,
+    initial_state,
+    p,
+    n,
+    m,
+    ic_weight,
+    physics_weight,
+):
+    collocation_t.requires_grad_(True)
+    prediction = model(collocation_t)
+    G = prediction[:, 0:1]
+    P = prediction[:, 1:2]
+
+    dG_dt = torch.autograd.grad(
+        G,
+        collocation_t,
+        grad_outputs=torch.ones_like(G),
+        create_graph=True,
+        retain_graph=True,
+    )[0]
+    dP_dt = torch.autograd.grad(
+        P,
+        collocation_t,
+        grad_outputs=torch.ones_like(P),
+        create_graph=True,
+    )[0]
+
+    rhs_G, rhs_P = torch_ode_rhs(G, P, p, n, m)
+    physics_loss = torch.mean((dG_dt - rhs_G) ** 2) + torch.mean(
+        (dP_dt - rhs_P) ** 2
+    )
+
+    t0 = torch.zeros((1, 1), dtype=torch.float32, device=collocation_t.device)
+    initial_prediction = model(t0)
+    ic_loss = torch.mean((initial_prediction - initial_state) ** 2)
+    total_loss = ic_weight * ic_loss + physics_weight * physics_loss
+    return total_loss, ic_loss, physics_loss
+
+
+def evaluate_pinn(model, t_values, device):
+    model.eval()
+    with torch.no_grad():
+        t_tensor = torch.tensor(
+            t_values.reshape(-1, 1), dtype=torch.float32, device=device
+        )
+        prediction = model(t_tensor).cpu().numpy()
+    model.train()
+    return prediction[:, 0], prediction[:, 1]
+
+
+def create_live_training_figure(
+    epochs_seen,
+    total_losses,
+    ic_losses,
+    physics_losses,
+    t_values,
+    G_pred,
+    P_pred,
+    G_reference,
+    P_reference,
+):
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+
+    axes[0].semilogy(epochs_seen, total_losses, label="Total loss", linewidth=2)
+    axes[0].semilogy(epochs_seen, ic_losses, label="Initial condition loss")
+    axes[0].semilogy(epochs_seen, physics_losses, label="Physics loss")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss (log scale)")
+    axes[0].set_title("PINN Learning Progress")
+    axes[0].grid(True, which="both", linestyle="--", alpha=0.5)
+    axes[0].legend()
+
+    axes[1].plot(t_values, G_reference, "r--", label="G ODE reference", alpha=0.75)
+    axes[1].plot(t_values, P_reference, "b--", label="P ODE reference", alpha=0.75)
+    axes[1].plot(t_values, G_pred, color="darkred", label="G PINN", linewidth=2)
+    axes[1].plot(t_values, P_pred, color="darkblue", label="P PINN", linewidth=2)
+    axes[1].set_xlabel("Time")
+    axes[1].set_ylabel("Concentration")
+    axes[1].set_title(f"Prediction at Epoch {epochs_seen[-1]}")
+    axes[1].grid(True, alpha=0.4)
+    axes[1].legend()
+
+    fig.tight_layout()
+    return fig
 
 # --- Streamlit UI Architecture ---
 
@@ -225,5 +354,236 @@ with tab3:
         st.write("No iterations were performed (perhaps the initial guess was already a root).")
 
 with tab4:
-    st.header("Machine Learning (Placeholder)")
-    st.info("Physics-Informed Neural Network (PINN) implementation coming soon.")
+    st.header("Physics-Informed Neural Network")
+    st.markdown(
+        "Train a neural network to predict **GATA-1** and **PU.1** while the "
+        "gene-regulation ODEs act as its training constraints. The dashed curves "
+        "are shown only as a reference and are not used as training labels."
+    )
+
+    if not sol.success:
+        st.error("The reference ODE solution failed, so PINN comparison is unavailable.")
+    elif t_end <= 0:
+        st.error("Time Span must be greater than zero before training the PINN.")
+    elif min(G0, P0) < 0:
+        st.error("PINN training requires non-negative initial concentrations.")
+    elif min(p['tha1'], p['tha2'], p['thb1'], p['thb2'], n, m) <= 0:
+        st.error(
+            "Hill thresholds and Hill coefficients must be greater than zero "
+            "before training the PINN."
+        )
+    else:
+        with st.expander("PINN Training Parameters", expanded=True):
+            ml_col1, ml_col2, ml_col3 = st.columns(3)
+            with ml_col1:
+                pinn_epochs = st.number_input(
+                    "Epochs", min_value=1, max_value=50000, value=1000, step=100
+                )
+                pinn_learning_rate = st.number_input(
+                    "Learning rate",
+                    min_value=0.000001,
+                    max_value=0.1,
+                    value=0.01,
+                    format="%.6f",
+                )
+                pinn_collocation = st.number_input(
+                    "Collocation points",
+                    min_value=10,
+                    max_value=5000,
+                    value=200,
+                    step=10,
+                )
+            with ml_col2:
+                pinn_layers = st.number_input(
+                    "Hidden layers", min_value=1, max_value=10, value=3, step=1
+                )
+                pinn_neurons = st.number_input(
+                    "Neurons per layer",
+                    min_value=4,
+                    max_value=512,
+                    value=32,
+                    step=4,
+                )
+                pinn_seed = st.number_input(
+                    "Random seed", min_value=0, max_value=100000, value=42, step=1
+                )
+            with ml_col3:
+                pinn_ic_weight = st.number_input(
+                    "Initial-condition loss weight",
+                    min_value=0.0,
+                    max_value=10000.0,
+                    value=10.0,
+                    format="%.2f",
+                )
+                pinn_physics_weight = st.number_input(
+                    "Physics loss weight",
+                    min_value=0.0,
+                    max_value=10000.0,
+                    value=1.0,
+                    format="%.2f",
+                )
+                pinn_update_every = st.number_input(
+                    "Live update every N epochs",
+                    min_value=1,
+                    max_value=50000,
+                    value=min(10, int(pinn_epochs)),
+                    step=1,
+                    help="Set to 1 to watch every epoch. Larger values train faster.",
+                )
+
+        train_pinn = st.button(
+            "Train PINN",
+            type="primary",
+            help="Training runs in this page and updates the charts as it learns.",
+        )
+
+        if train_pinn:
+            torch.manual_seed(int(pinn_seed))
+            np.random.seed(int(pinn_seed))
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            model = PINN(
+                t_end=t_end,
+                hidden_layers=int(pinn_layers),
+                neurons=int(pinn_neurons),
+            ).to(device)
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=float(pinn_learning_rate)
+            )
+
+            collocation_t = torch.linspace(
+                0.0,
+                float(t_end),
+                int(pinn_collocation),
+                device=device,
+            ).reshape(-1, 1)
+            initial_state = torch.tensor(
+                [[G0, P0]], dtype=torch.float32, device=device
+            )
+
+            plot_t = np.linspace(0.0, t_end, 300)
+            G_reference = np.interp(plot_t, sol.t, sol.y[0])
+            P_reference = np.interp(plot_t, sol.t, sol.y[1])
+
+            status_placeholder = st.empty()
+            progress_bar = st.progress(0.0)
+            metric_cols = st.columns(4)
+            total_metric = metric_cols[0].empty()
+            physics_metric = metric_cols[1].empty()
+            ic_metric = metric_cols[2].empty()
+            mse_metric = metric_cols[3].empty()
+            chart_placeholder = st.empty()
+
+            epochs_seen = []
+            total_losses = []
+            ic_losses = []
+            physics_losses = []
+            mse_history = []
+
+            for epoch in range(1, int(pinn_epochs) + 1):
+                optimizer.zero_grad()
+                total_loss, ic_loss, physics_loss = calculate_pinn_loss(
+                    model,
+                    collocation_t,
+                    initial_state,
+                    p,
+                    n,
+                    m,
+                    float(pinn_ic_weight),
+                    float(pinn_physics_weight),
+                )
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                optimizer.step()
+
+                should_update = (
+                    epoch == 1
+                    or epoch % int(pinn_update_every) == 0
+                    or epoch == int(pinn_epochs)
+                )
+                if should_update:
+                    G_pred, P_pred = evaluate_pinn(model, plot_t, device)
+                    prediction_mse = float(
+                        np.mean((G_pred - G_reference) ** 2)
+                        + np.mean((P_pred - P_reference) ** 2)
+                    )
+
+                    epochs_seen.append(epoch)
+                    total_losses.append(float(total_loss.detach().cpu()))
+                    ic_losses.append(float(ic_loss.detach().cpu()))
+                    physics_losses.append(float(physics_loss.detach().cpu()))
+                    mse_history.append(prediction_mse)
+
+                    status_placeholder.write(
+                        f"Training on **{device.type.upper()}**: epoch "
+                        f"**{epoch:,} / {int(pinn_epochs):,}**"
+                    )
+                    progress_bar.progress(epoch / int(pinn_epochs))
+                    total_metric.metric("Total loss", f"{total_losses[-1]:.3e}")
+                    physics_metric.metric(
+                        "Physics loss", f"{physics_losses[-1]:.3e}"
+                    )
+                    ic_metric.metric("IC loss", f"{ic_losses[-1]:.3e}")
+                    mse_improvement = (
+                        0.0
+                        if mse_history[0] == 0
+                        else 100.0 * (mse_history[0] - prediction_mse) / mse_history[0]
+                    )
+                    mse_metric.metric(
+                        "ODE comparison MSE",
+                        f"{prediction_mse:.3e}",
+                        delta=f"{mse_improvement:.1f}% vs epoch 1",
+                    )
+
+                    live_figure = create_live_training_figure(
+                        epochs_seen,
+                        total_losses,
+                        ic_losses,
+                        physics_losses,
+                        plot_t,
+                        G_pred,
+                        P_pred,
+                        G_reference,
+                        P_reference,
+                    )
+                    chart_placeholder.pyplot(live_figure)
+                    plt.close(live_figure)
+
+            st.session_state["pinn_result"] = {
+                "t": plot_t,
+                "G": G_pred,
+                "P": P_pred,
+                "G_reference": G_reference,
+                "P_reference": P_reference,
+                "epochs": epochs_seen,
+                "total_losses": total_losses,
+                "ic_losses": ic_losses,
+                "physics_losses": physics_losses,
+                "mse_history": mse_history,
+                "device": device.type,
+            }
+            status_placeholder.success(
+                f"Training complete after {int(pinn_epochs):,} epochs on "
+                f"{device.type.upper()}. Final comparison MSE: {mse_history[-1]:.3e}"
+            )
+
+        elif "pinn_result" in st.session_state:
+            result = st.session_state["pinn_result"]
+            st.info(
+                "Showing the most recent trained PINN. Press **Train PINN** to "
+                "retrain it with the current parameters."
+            )
+            saved_figure = create_live_training_figure(
+                result["epochs"],
+                result["total_losses"],
+                result["ic_losses"],
+                result["physics_losses"],
+                result["t"],
+                result["G"],
+                result["P"],
+                result["G_reference"],
+                result["P_reference"],
+            )
+            st.pyplot(saved_figure)
+            plt.close(saved_figure)
+            st.metric("Final ODE comparison MSE", f"{result['mse_history'][-1]:.3e}")

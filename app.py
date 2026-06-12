@@ -1,187 +1,20 @@
+import warnings
+
 import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-# --- Core Mathematical Logic ---
-
-def calculate_terms(G, P, p, n, m):
-    Gterm1 = p['a1'] * (G**n) / (p['tha1']**n + G**n)
-    Gterm2 = p['b1'] * (p['thb1']**m) / (p['thb1']**m + (G**m) * (P**m))
-    Gterm3 = -p['k1'] * G
-    Pterm1 = p['a2'] * (P**n) / (p['tha2']**n + P**n)
-    Pterm2 = p['b2'] * (p['thb2']**m) / (p['thb2']**m + (G**m) * (P**m))
-    Pterm3 = -p['k2'] * P
-    return Gterm1, Gterm2, Gterm3, Pterm1, Pterm2, Pterm3
-
-def ode_system(t, vars, p, n, m):
-    G, P = vars
-    g1, g2, g3, p1, p2, p3 = calculate_terms(G, P, p, n, m)
-    return [g1 + g2 + g3, p1 + p2 + p3]
-
-def algebraic_system(vars, p, n, m):
-    return np.array(ode_system(0, vars, p, n, m))
-
-def compute_jacobian(func, vars, epsilon=1e-5):
-    n_vars = len(vars)
-    jacobian = np.zeros((n_vars, n_vars))
-    for i in range(n_vars):
-        v_plus = np.copy(vars)
-        v_minus = np.copy(vars)
-        v_plus[i] += epsilon
-        v_minus[i] -= epsilon
-        jacobian[:, i] = (func(v_plus) - func(v_minus)) / (2 * epsilon)
-    return jacobian
-
-def solve_newton(initial_guess, p, n, m, tolerance=1e-6, max_iter=50):
-    v = np.array(initial_guess, dtype=float)
-    history = [v.copy()]
-    errors = []
-    for i in range(max_iter):
-        F_val = algebraic_system(v, p, n, m)
-        err_norm = np.linalg.norm(F_val)
-        errors.append(err_norm)
-        if err_norm < tolerance: break
-        J = compute_jacobian(lambda x: algebraic_system(x, p, n, m), v)
-        # Add small damping or pseudo-inverse if singular, though standard inverse is usually fine
-        try:
-            delta = np.linalg.solve(J, -F_val)
-        except np.linalg.LinAlgError:
-            st.warning("Jacobian is singular, using pseudo-inverse.")
-            delta = np.linalg.pinv(J).dot(-F_val)
-        v = v + delta
-        history.append(v.copy())
-    return v, np.array(history), errors
-
-
-# --- Physics-Informed Neural Network Logic ---
-
-class PINN(nn.Module):
-    """Neural network that learns the positive concentrations G(t) and P(t)."""
-
-    def __init__(self, t_end, hidden_layers=3, neurons=32):
-        super().__init__()
-        self.t_end = max(float(t_end), 1e-6)
-
-        layers = [nn.Linear(1, neurons), nn.Tanh()]
-        for _ in range(hidden_layers - 1):
-            layers.extend([nn.Linear(neurons, neurons), nn.Tanh()])
-        layers.append(nn.Linear(neurons, 2))
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, t):
-        # Normalization keeps the network input in a training-friendly range.
-        normalized_t = 2.0 * t / self.t_end - 1.0
-        return F.softplus(self.network(normalized_t)) + 1e-6
-
-
-def torch_ode_rhs(G, P, p, n, m):
-    """Torch version of the governing equations used in the PINN loss."""
-    g_activation = p['a1'] * G.pow(n) / (p['tha1']**n + G.pow(n))
-    g_inhibition = (
-        p['b1'] * p['thb1']**m
-        / (p['thb1']**m + G.pow(m) * P.pow(m))
-    )
-    p_activation = p['a2'] * P.pow(n) / (p['tha2']**n + P.pow(n))
-    p_inhibition = (
-        p['b2'] * p['thb2']**m
-        / (p['thb2']**m + G.pow(m) * P.pow(m))
-    )
-    return (
-        g_activation + g_inhibition - p['k1'] * G,
-        p_activation + p_inhibition - p['k2'] * P,
-    )
-
-
-def calculate_pinn_loss(
-    model,
-    collocation_t,
-    initial_state,
-    p,
-    n,
-    m,
-    ic_weight,
-    physics_weight,
-):
-    collocation_t.requires_grad_(True)
-    prediction = model(collocation_t)
-    G = prediction[:, 0:1]
-    P = prediction[:, 1:2]
-
-    dG_dt = torch.autograd.grad(
-        G,
-        collocation_t,
-        grad_outputs=torch.ones_like(G),
-        create_graph=True,
-        retain_graph=True,
-    )[0]
-    dP_dt = torch.autograd.grad(
-        P,
-        collocation_t,
-        grad_outputs=torch.ones_like(P),
-        create_graph=True,
-    )[0]
-
-    rhs_G, rhs_P = torch_ode_rhs(G, P, p, n, m)
-    physics_loss = torch.mean((dG_dt - rhs_G) ** 2) + torch.mean(
-        (dP_dt - rhs_P) ** 2
-    )
-
-    t0 = torch.zeros((1, 1), dtype=torch.float32, device=collocation_t.device)
-    initial_prediction = model(t0)
-    ic_loss = torch.mean((initial_prediction - initial_state) ** 2)
-    total_loss = ic_weight * ic_loss + physics_weight * physics_loss
-    return total_loss, ic_loss, physics_loss
-
-
-def evaluate_pinn(model, t_values, device):
-    model.eval()
-    with torch.no_grad():
-        t_tensor = torch.tensor(
-            t_values.reshape(-1, 1), dtype=torch.float32, device=device
-        )
-        prediction = model(t_tensor).cpu().numpy()
-    model.train()
-    return prediction[:, 0], prediction[:, 1]
-
-
-def create_live_training_figure(
-    epochs_seen,
-    total_losses,
-    ic_losses,
-    physics_losses,
-    t_values,
-    G_pred,
-    P_pred,
-    G_reference,
-    P_reference,
-):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
-
-    axes[0].semilogy(epochs_seen, total_losses, label="Total loss", linewidth=2)
-    axes[0].semilogy(epochs_seen, ic_losses, label="Initial condition loss")
-    axes[0].semilogy(epochs_seen, physics_losses, label="Physics loss")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss (log scale)")
-    axes[0].set_title("PINN Learning Progress")
-    axes[0].grid(True, which="both", linestyle="--", alpha=0.5)
-    axes[0].legend()
-
-    axes[1].plot(t_values, G_reference, "r--", label="G ODE reference", alpha=0.75)
-    axes[1].plot(t_values, P_reference, "b--", label="P ODE reference", alpha=0.75)
-    axes[1].plot(t_values, G_pred, color="darkred", label="G PINN", linewidth=2)
-    axes[1].plot(t_values, P_pred, color="darkblue", label="P PINN", linewidth=2)
-    axes[1].set_xlabel("Time")
-    axes[1].set_ylabel("Concentration")
-    axes[1].set_title(f"Prediction at Epoch {epochs_seen[-1]}")
-    axes[1].grid(True, alpha=0.4)
-    axes[1].legend()
-
-    fig.tight_layout()
-    return fig
+# --- Solver Imports ---
+from solvers.core import ode_system, calculate_terms
+from solvers.numerical.newton import solve_newton
+from solvers.ml.pinn import (
+    PINN,
+    calculate_pinn_loss,
+    evaluate_pinn,
+    create_live_training_figure,
+)
 
 # --- Streamlit UI Architecture ---
 
@@ -284,7 +117,11 @@ with tab1:
 with tab2:
     st.header("Phase Plane & Steady States (Newton-Raphson)")
     
-    root, history, errors = solve_newton([G0, P0], p, n, m)
+    with warnings.catch_warnings(record=True) as caught_warnings:
+        warnings.simplefilter("always")
+        root, history, errors = solve_newton([G0, P0], p, n, m)
+    for w in caught_warnings:
+        st.warning(str(w.message))
     
     # Heuristic for determining grid bounds
     max_val = max(2.0, G0 * 1.5, P0 * 1.5, root[0] * 1.5, root[1] * 1.5)

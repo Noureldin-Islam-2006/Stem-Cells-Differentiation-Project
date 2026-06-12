@@ -2,6 +2,7 @@ import warnings
 
 import streamlit as st
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 import torch
@@ -17,14 +18,14 @@ from solvers.ml.pinn import (
     create_live_training_figure,
 )
 from solvers.ml.lno import (
-    build_model as build_lno,
-    generate_dataset as generate_lno_dataset,
-    plot_dataset_samples as plot_lno_dataset_samples,
-    load_data as load_lno_data,
-    train as train_lno,
-    evaluate_and_plot as evaluate_lno_and_plot,
+    LaplaceNeuralOperator,
+    generate_training_data,
+    prepare_dataloaders,
+    train_one_epoch,
+    evaluate as lno_evaluate,
+    predict_sample,
+    create_lno_training_figure,
 )
-import os
 
 # --- Streamlit UI Architecture ---
 
@@ -76,7 +77,7 @@ t_eval = np.linspace(0, t_end, max(1000, int(t_end*10)))
 sol = solve_ivp(ode_system, t_span, [G0, P0], args=(p, n, m), t_eval=t_eval, method='LSODA')
 
 # 3. Main Panel (Tabs)
-tab1, tab2, tab3, tab4 = st.tabs(["System Dynamics", "Phase Plane & Steady States", "Convergence Analysis", "Machine Learning"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["System Dynamics", "Phase Plane & Steady States", "Convergence Analysis", "Machine Learning", "Benchmarking"])
 
 with tab1:
     st.header("System Dynamics")
@@ -97,6 +98,7 @@ with tab1:
             ax1.legend()
             ax1.grid(True)
             st.pyplot(fig1)
+            plt.close(fig1)
 
             g1, g2, g3, p1, p2, p3 = calculate_terms(sol.y[0], sol.y[1], p, n, m)
             st.subheader("Component Breakdown")
@@ -113,6 +115,7 @@ with tab1:
                 ax2.legend()
                 ax2.grid(True)
                 st.pyplot(fig2)
+                plt.close(fig2)
             with col2:
                 fig3, ax3 = plt.subplots(figsize=(6, 4))
                 ax3.plot(sol.t, p1, label='Auto-activation', color='darkblue', linestyle='--')
@@ -125,6 +128,7 @@ with tab1:
                 ax3.legend()
                 ax3.grid(True)
                 st.pyplot(fig3)
+                plt.close(fig3)
         else:
             st.error("ODE Solver failed to converge.")
 
@@ -164,6 +168,7 @@ with tab1:
                     ax_s.legend()
                     ax_s.grid(True)
                     st.pyplot(fig_s)
+                    plt.close(fig_s)
                 except Exception as exc:
                     st.error(f"Solver error: {exc}")
 
@@ -225,6 +230,7 @@ with tab2:
     ax4.grid(True)
     
     st.pyplot(fig4)
+    plt.close(fig4)
     st.success(f"**Found Steady State (Root):** G = {root[0]:.4f}, P = {root[1]:.4f}")
 
 with tab3:
@@ -235,24 +241,74 @@ with tab3:
     selected_conv = st.selectbox("Method to analyse", conv_methods, key="conv_method")
 
     if selected_conv == "Newton-Raphson":
-        st.markdown("Residual L2 norm at each Newton-Raphson iteration (linear scale).")
-        nr_tol = st.number_input("Tolerance", min_value=1e-12, max_value=1.0, value=1e-6, format="%.1e", key="nr_tol")
-        nr_max = st.number_input("Max iterations", min_value=1, max_value=500, value=50, step=1, key="nr_max")
-        with warnings.catch_warnings(record=True) as cw:
-            warnings.simplefilter("always")
-            _, _, nr_errors = solve_newton([G0, P0], p, n, m, tolerance=nr_tol, max_iter=nr_max)
-        for w in cw:
-            st.warning(str(w.message))
-        if len(nr_errors) > 0:
-            fig5, ax5 = plt.subplots(figsize=(8, 5))
-            ax5.plot(range(1, len(nr_errors) + 1), nr_errors, 'mo-', linewidth=2)
-            ax5.set_xlabel('Iteration')
-            ax5.set_ylabel('L2 Norm of Residual')
-            ax5.set_title('Newton-Raphson Iteration Error')
-            ax5.grid(True, ls="--")
-            st.pyplot(fig5)
+        st.markdown("Convergence of Newton-Raphson root finder against the SciPy reference steady state.")
+
+        if not sol.success:
+            st.error("Reference solution failed — cannot compute errors.")
         else:
-            st.write("Initial guess is already a root — no iterations needed.")
+            err_col1, err_col2 = st.columns(2)
+
+            # Compute the SciPy reference steady state (final value of long integration)
+            G_ref_ss = sol.y[0, -1]
+            P_ref_ss = sol.y[1, -1]
+            ref_norm = np.sqrt(G_ref_ss**2 + P_ref_ss**2)
+            if ref_norm < 1e-15:
+                ref_norm = 1.0  # avoid division by zero
+
+            # --- Tolerance sweep (analogous to step-size error) ---
+            with err_col1:
+                st.subheader("Tolerance Sweep")
+                nr_tol_min_exp = st.number_input("Min tolerance (exponent)", min_value=-15, max_value=-1, value=-10, step=1, key="nr_tol_min")
+                nr_tol_max_exp = st.number_input("Max tolerance (exponent)", min_value=-10, max_value=0, value=-1, step=1, key="nr_tol_max")
+                nr_tol_count = st.number_input("Number of tolerances", min_value=2, max_value=20, value=8, step=1, key="nr_tol_count")
+
+                tol_values = np.logspace(nr_tol_max_exp, nr_tol_min_exp, int(nr_tol_count))
+                tol_errors = []
+                for tol_val in tol_values:
+                    with warnings.catch_warnings(record=True):
+                        warnings.simplefilter("always")
+                        root, _, _ = solve_newton([G0, P0], p, n, m, tolerance=float(tol_val), max_iter=200)
+                    rel_err = np.sqrt((root[0] - G_ref_ss)**2 + (root[1] - P_ref_ss)**2) / ref_norm
+                    tol_errors.append(rel_err)
+
+                fig_ts, ax_ts = plt.subplots(figsize=(6, 4))
+                ax_ts.plot(tol_values, tol_errors, 'rs-', linewidth=2)
+                ax_ts.set_xlabel('Tolerance')
+                ax_ts.set_ylabel('Relative L2 Error vs Reference')
+                ax_ts.set_title('Error vs Tolerance')
+                ax_ts.set_xscale('log')
+                ax_ts.invert_xaxis()
+                ax_ts.grid(True, ls="--")
+                st.pyplot(fig_ts)
+                plt.close(fig_ts)
+
+            # --- Per-Iteration Error ---
+            with err_col2:
+                st.subheader("Iteration Error")
+                nr_tol = st.number_input("Tolerance", min_value=1e-12, max_value=1.0, value=1e-6, format="%.1e", key="nr_tol")
+                nr_max = st.number_input("Max iterations", min_value=1, max_value=500, value=50, step=1, key="nr_max")
+                with warnings.catch_warnings(record=True) as cw:
+                    warnings.simplefilter("always")
+                    _, nr_history, _ = solve_newton([G0, P0], p, n, m, tolerance=nr_tol, max_iter=nr_max)
+                for w in cw:
+                    st.warning(str(w.message))
+
+                if len(nr_history) > 1:
+                    iter_rel_errs = []
+                    for iterate in nr_history:
+                        rel_err = np.sqrt((iterate[0] - G_ref_ss)**2 + (iterate[1] - P_ref_ss)**2) / ref_norm
+                        iter_rel_errs.append(rel_err)
+
+                    fig_it, ax_it = plt.subplots(figsize=(6, 4))
+                    ax_it.plot(range(len(iter_rel_errs)), iter_rel_errs, 'b-o', linewidth=2)
+                    ax_it.set_xlabel('Iteration')
+                    ax_it.set_ylabel('Relative L2 Error vs Reference')
+                    ax_it.set_title(f'Per-Iteration Error  (tol = {nr_tol:.0e})')
+                    ax_it.grid(True, ls="--")
+                    st.pyplot(fig_it)
+                    plt.close(fig_it)
+                else:
+                    st.write("Initial guess is already at the root — no iterations needed.")
 
     else:
         # Find the selected solver module
@@ -278,7 +334,9 @@ with tab3:
                         t_s, y_s = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(dt_val))
                         G_interp = np.interp(t_s, sol.t, sol.y[0])
                         P_interp = np.interp(t_s, sol.t, sol.y[1])
-                        err = np.max(np.sqrt((y_s[0] - G_interp)**2 + (y_s[1] - P_interp)**2))
+                        ref_norms = np.sqrt(G_interp**2 + P_interp**2)
+                        ref_norms = np.where(ref_norms < 1e-15, 1.0, ref_norms)
+                        err = np.max(np.sqrt((y_s[0] - G_interp)**2 + (y_s[1] - P_interp)**2) / ref_norms)
                         ss_errors.append(err)
                     except Exception:
                         ss_errors.append(np.nan)
@@ -286,10 +344,11 @@ with tab3:
                 fig_ss, ax_ss = plt.subplots(figsize=(6, 4))
                 ax_ss.plot(dt_values, ss_errors, 'rs-', linewidth=2)
                 ax_ss.set_xlabel('Step Size (h)')
-                ax_ss.set_ylabel('Max L2 Error vs Reference')
+                ax_ss.set_ylabel('Max Relative L2 Error')
                 ax_ss.set_title('Step Size Error')
                 ax_ss.grid(True, ls="--")
                 st.pyplot(fig_ss)
+                plt.close(fig_ss)
 
             # --- Iteration (Per-Step) Error ---
             with err_col2:
@@ -304,23 +363,27 @@ with tab3:
                     t_it, y_it = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(iter_dt))
                     G_ref_it = np.interp(t_it, sol.t, sol.y[0])
                     P_ref_it = np.interp(t_it, sol.t, sol.y[1])
-                    iter_errs = np.sqrt((y_it[0] - G_ref_it)**2 + (y_it[1] - P_ref_it)**2)
+                    ref_norms_it = np.sqrt(G_ref_it**2 + P_ref_it**2)
+                    ref_norms_it = np.where(ref_norms_it < 1e-15, 1.0, ref_norms_it)
+                    iter_errs = np.sqrt((y_it[0] - G_ref_it)**2 + (y_it[1] - P_ref_it)**2) / ref_norms_it
 
                     fig_it, ax_it = plt.subplots(figsize=(6, 4))
                     ax_it.plot(t_it, iter_errs, 'b-', linewidth=2)
                     ax_it.set_xlabel('Time')
-                    ax_it.set_ylabel('L2 Error vs Reference')
+                    ax_it.set_ylabel('Relative L2 Error')
                     ax_it.set_title(f'Per-Step Error  (dt = {iter_dt})')
                     ax_it.grid(True, ls="--")
                     st.pyplot(fig_it)
+                    plt.close(fig_it)
                 except Exception as exc:
                     st.error(f"Solver error: {exc}")
 
-with tab4:
-    st.header("Machine Learning Solvers")
-    ml_subtab1, ml_subtab2 = st.tabs(["Physics-Informed Neural Network (PINN)", "Laplace Neural Operator (LNO)"])
 
-    with ml_subtab1:
+with tab4:
+    st.header("Machine Learning")
+    ml_tab_pinn, ml_tab_lno = st.tabs(["Physics-Informed Neural Network (PINN)", "Laplace Neural Operator (LNO)"])
+
+    with ml_tab_pinn:
         st.subheader("Physics-Informed Neural Network")
         st.markdown(
             "Train a neural network to predict **GATA-1** and **PU.1** while the "
@@ -419,10 +482,7 @@ with tab4:
                 )
 
                 collocation_t = torch.linspace(
-                    0.0,
-                    float(t_end),
-                    int(pinn_collocation),
-                    device=device,
+                    0.0, float(t_end), int(pinn_collocation), device=device,
                 ).reshape(-1, 1)
                 initial_state = torch.tensor(
                     [[G0, P0]], dtype=torch.float32, device=device
@@ -441,93 +501,49 @@ with tab4:
                 mse_metric = metric_cols[3].empty()
                 chart_placeholder = st.empty()
 
-                epochs_seen = []
-                total_losses = []
-                ic_losses = []
-                physics_losses = []
-                mse_history = []
+                epochs_seen, total_losses, ic_losses, physics_losses, mse_history = [], [], [], [], []
 
                 for epoch in range(1, int(pinn_epochs) + 1):
                     optimizer.zero_grad()
                     total_loss, ic_loss, physics_loss = calculate_pinn_loss(
-                        model,
-                        collocation_t,
-                        initial_state,
-                        p,
-                        n,
-                        m,
-                        float(pinn_ic_weight),
-                        float(pinn_physics_weight),
+                        model, collocation_t, initial_state, p, n, m,
+                        float(pinn_ic_weight), float(pinn_physics_weight),
                     )
                     total_loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                     optimizer.step()
 
-                    should_update = (
-                        epoch == 1
-                        or epoch % int(pinn_update_every) == 0
-                        or epoch == int(pinn_epochs)
-                    )
+                    should_update = (epoch == 1 or epoch % int(pinn_update_every) == 0 or epoch == int(pinn_epochs))
                     if should_update:
                         G_pred, P_pred = evaluate_pinn(model, plot_t, device)
-                        prediction_mse = float(
-                            np.mean((G_pred - G_reference) ** 2)
-                            + np.mean((P_pred - P_reference) ** 2)
-                        )
-
+                        prediction_mse = float(np.mean((G_pred - G_reference)**2) + np.mean((P_pred - P_reference)**2))
                         epochs_seen.append(epoch)
                         total_losses.append(float(total_loss.detach().cpu()))
                         ic_losses.append(float(ic_loss.detach().cpu()))
                         physics_losses.append(float(physics_loss.detach().cpu()))
                         mse_history.append(prediction_mse)
 
-                        status_placeholder.write(
-                            f"Training on **{device.type.upper()}**: epoch "
-                            f"**{epoch:,} / {int(pinn_epochs):,}**"
-                        )
+                        status_placeholder.write(f"Training on **{device.type.upper()}**: epoch **{epoch:,} / {int(pinn_epochs):,}**")
                         progress_bar.progress(epoch / int(pinn_epochs))
                         total_metric.metric("Total loss", f"{total_losses[-1]:.3e}")
-                        physics_metric.metric(
-                            "Physics loss", f"{physics_losses[-1]:.3e}"
-                        )
+                        physics_metric.metric("Physics loss", f"{physics_losses[-1]:.3e}")
                         ic_metric.metric("IC loss", f"{ic_losses[-1]:.3e}")
-                        mse_improvement = (
-                            0.0
-                            if mse_history[0] == 0
-                            else 100.0 * (mse_history[0] - prediction_mse) / mse_history[0]
-                        )
-                        mse_metric.metric(
-                            "ODE comparison MSE",
-                            f"{prediction_mse:.3e}",
-                            delta=f"{mse_improvement:.1f}% vs epoch 1",
-                        )
+                        mse_improvement = 0.0 if mse_history[0] == 0 else 100.0 * (mse_history[0] - prediction_mse) / mse_history[0]
+                        mse_metric.metric("ODE comparison MSE", f"{prediction_mse:.3e}", delta=f"{mse_improvement:.1f}% vs epoch 1")
 
                         live_figure = create_live_training_figure(
-                            epochs_seen,
-                            total_losses,
-                            ic_losses,
-                            physics_losses,
-                            plot_t,
-                            G_pred,
-                            P_pred,
-                            G_reference,
-                            P_reference,
+                            epochs_seen, total_losses, ic_losses, physics_losses,
+                            plot_t, G_pred, P_pred, G_reference, P_reference,
                         )
                         chart_placeholder.pyplot(live_figure)
                         plt.close(live_figure)
 
                 st.session_state["pinn_result"] = {
-                    "t": plot_t,
-                    "G": G_pred,
-                    "P": P_pred,
-                    "G_reference": G_reference,
-                    "P_reference": P_reference,
-                    "epochs": epochs_seen,
-                    "total_losses": total_losses,
-                    "ic_losses": ic_losses,
-                    "physics_losses": physics_losses,
-                    "mse_history": mse_history,
-                    "device": device.type,
+                    "t": plot_t, "G": G_pred, "P": P_pred,
+                    "G_reference": G_reference, "P_reference": P_reference,
+                    "epochs": epochs_seen, "total_losses": total_losses,
+                    "ic_losses": ic_losses, "physics_losses": physics_losses,
+                    "mse_history": mse_history, "device": device.type,
                 }
                 status_placeholder.success(
                     f"Training complete after {int(pinn_epochs):,} epochs on "
@@ -536,157 +552,388 @@ with tab4:
 
             elif "pinn_result" in st.session_state:
                 result = st.session_state["pinn_result"]
-                st.info(
-                    "Showing the most recent trained PINN. Press **Train PINN** to "
-                    "retrain it with the current parameters."
-                )
+                st.info("Showing the most recent trained PINN. Press **Train PINN** to retrain it with the current parameters.")
                 saved_figure = create_live_training_figure(
-                    result["epochs"],
-                    result["total_losses"],
-                    result["ic_losses"],
-                    result["physics_losses"],
-                    result["t"],
-                    result["G"],
-                    result["P"],
-                    result["G_reference"],
-                    result["P_reference"],
+                    result["epochs"], result["total_losses"], result["ic_losses"],
+                    result["physics_losses"], result["t"], result["G"], result["P"],
+                    result["G_reference"], result["P_reference"],
                 )
                 st.pyplot(saved_figure)
                 plt.close(saved_figure)
                 st.metric("Final ODE comparison MSE", f"{result['mse_history'][-1]:.3e}")
 
-    with ml_subtab2:
+    # ── LNO Sub-Tab ──────────────────────────────────────────────────────
+    with ml_tab_lno:
         st.subheader("Laplace Neural Operator")
         st.markdown(
-            "The Laplace Neural Operator (LNO) maps initial conditions directly to full trajectories "
-            "by learning linear operations in the Laplace frequency domain. This architecture naturally "
-            "handles stiffness through damping parameters in the frequency domain."
+            "A **data-driven** neural operator that maps initial conditions → full "
+            "trajectories by learning in the Laplace/frequency domain. Unlike the PINN, "
+            "the LNO trains on pre-generated BDF solutions and performs instant inference "
+            "for any new initial condition."
         )
 
-        ic_exists = os.path.exists("ic_samples.npy")
-        traj_exists = os.path.exists("trajectories.npy")
+        with st.expander("LNO Hyperparameters", expanded=True):
+            lc1, lc2, lc3 = st.columns(3)
+            with lc1:
+                lno_epochs = st.number_input("Epochs", min_value=1, max_value=5000, value=100, step=10, key="lno_epochs")
+                lno_lr = st.number_input("Learning rate", min_value=1e-5, max_value=0.01, value=1e-3, format="%.5f", key="lno_lr")
+                lno_samples = st.number_input("Training samples", min_value=50, max_value=5000, value=200, step=50, key="lno_samples")
+            with lc2:
+                lno_d_model = st.number_input("Latent width (d_model)", min_value=16, max_value=256, value=64, step=16, key="lno_d_model")
+                lno_blocks = st.number_input("LNO blocks", min_value=1, max_value=12, value=4, step=1, key="lno_blocks")
+                lno_modes = st.number_input("Fourier modes", min_value=8, max_value=256, value=32, step=8, key="lno_modes")
+            with lc3:
+                lno_timesteps = st.number_input("Time steps per trajectory", min_value=50, max_value=2000, value=201, step=50, key="lno_timesteps")
+                lno_batch = st.number_input("Batch size", min_value=4, max_value=128, value=32, step=4, key="lno_batch")
+                lno_seed = st.number_input("Random seed", min_value=0, max_value=100000, value=42, step=1, key="lno_seed")
 
-        # 1. Dataset Generation
-        with st.expander("Dataset Generation (Stiff BDF Trajectories)", expanded=not (ic_exists and traj_exists)):
-            st.markdown("Generate trajectory samples using scipy's stiff BDF solver to train the LNO.")
-            gen_col1, gen_col2 = st.columns(2)
-            with gen_col1:
-                n_traj = st.number_input("Number of trajectories", min_value=10, max_value=5000, value=1000, step=100)
-                t_end_gen = st.number_input("Time end (t_end)", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
-            with gen_col2:
-                n_steps = st.number_input("Time steps per trajectory", min_value=10, max_value=2000, value=501, step=50)
-                ic_range_max = st.number_input("Max initial concentration", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
 
-            generate_btn = st.button("Generate Dataset", type="secondary")
-            if generate_btn:
-                with st.spinner("Generating trajectories using scipy BDF solver..."):
-                    ics, trajs, t_eval = generate_lno_dataset(
-                        n_traj=int(n_traj),
-                        t_end=float(t_end_gen),
-                        n_steps=int(n_steps),
-                        ic_range=(0.0, float(ic_range_max)),
-                        seed=42,
-                        ic_path="ic_samples.npy",
-                        traj_path="trajectories.npy",
+        train_lno = st.button("Train LNO", type="primary", key="train_lno_btn")
+
+        if train_lno:
+            torch.manual_seed(int(lno_seed))
+            np.random.seed(int(lno_seed))
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+            # Step 1: Generate training data
+            data_status = st.empty()
+            data_status.info(f"Generating {int(lno_samples)} BDF trajectories...")
+            ics, trajectories = generate_training_data(
+                p, n, m, t_end, int(lno_samples), int(lno_timesteps), seed=int(lno_seed),
+            )
+            data_status.success(f"Generated {int(lno_samples)} trajectories ({int(lno_timesteps)} steps each).")
+
+            # Step 2: Prepare data
+            train_loader, test_loader, norm_stats, t_norm = prepare_dataloaders(
+                ics, trajectories, train_frac=0.8, batch_size=int(lno_batch), seed=int(lno_seed),
+            )
+            t_grid_dev = t_norm.to(device)
+
+            # Step 3: Build model
+            lno_model = LaplaceNeuralOperator(
+                T=int(lno_timesteps), d_model=int(lno_d_model),
+                n_lno_blocks=int(lno_blocks), n_modes=int(lno_modes),
+                mlp_hidden=int(lno_d_model) * 2, lifting_layers=2, proj_layers=2,
+                d_enc=max(32, int(lno_d_model) // 2),
+            ).to(device)
+            n_params = sum(pp.numel() for pp in lno_model.parameters() if pp.requires_grad)
+            st.caption(f"Model: {n_params:,} trainable parameters")
+
+            # Step 4: Train with live updates
+            criterion = torch.nn.MSELoss()
+            lno_optimizer = torch.optim.Adam(lno_model.parameters(), lr=float(lno_lr), weight_decay=1e-4)
+
+            lno_status = st.empty()
+            lno_progress = st.progress(0.0)
+            lno_mcols = st.columns(3)
+            lno_train_m = lno_mcols[0].empty()
+            lno_test_m = lno_mcols[1].empty()
+            lno_time_m = lno_mcols[2].empty()
+            lno_chart = st.empty()
+
+            ep_list, tr_list, te_list = [], [], []
+            update_every = max(1, int(lno_epochs) // 20)
+
+            for ep in range(1, int(lno_epochs) + 1):
+                tr_loss = train_one_epoch(lno_model, train_loader, lno_optimizer, criterion, t_grid_dev, device)
+                should_show = (ep == 1 or ep % update_every == 0 or ep == int(lno_epochs))
+                if should_show:
+                    te_loss = lno_evaluate(lno_model, test_loader, criterion, t_grid_dev, device)
+                    ep_list.append(ep)
+                    tr_list.append(tr_loss)
+                    te_list.append(te_loss)
+
+                    lno_status.write(f"Training on **{device.type.upper()}**: epoch **{ep:,} / {int(lno_epochs):,}**")
+                    lno_progress.progress(ep / int(lno_epochs))
+                    lno_train_m.metric("Train MSE", f"{tr_loss:.3e}")
+                    lno_test_m.metric("Test MSE", f"{te_loss:.3e}")
+
+                    # Predict on current ICs for live preview
+                    t_pred, G_lno, P_lno, inf_ms = predict_sample(
+                        lno_model, [G0, P0], t_norm, norm_stats, t_end, device,
                     )
-                    plot_lno_dataset_samples(ics, trajs, t_eval, n_show=12, out_path="dataset_samples.png")
-                    st.success("Successfully generated dataset!")
-                    st.image("dataset_samples.png", caption="Generated Dataset Trajectory Samples")
+                    lno_time_m.metric("Inference", f"{inf_ms:.1f} ms")
 
-        # Show if dataset files exist
-        if os.path.exists("ic_samples.npy") and os.path.exists("trajectories.npy"):
-            st.info("✅ Dataset files (`ic_samples.npy`, `trajectories.npy`) exist. Ready to train.")
-        else:
-            st.warning("⚠️ No dataset files found. Please generate the dataset before training.")
+                    G_ref_lno = np.interp(t_pred, sol.t, sol.y[0]) if sol.success else np.zeros_like(t_pred)
+                    P_ref_lno = np.interp(t_pred, sol.t, sol.y[1]) if sol.success else np.zeros_like(t_pred)
 
-        # 2. LNO Training
-        with st.expander("LNO Hyperparameters & Architecture", expanded=True):
-            train_col1, train_col2, train_col3 = st.columns(3)
-            with train_col1:
-                lno_epochs = st.number_input("LNO Epochs", min_value=1, max_value=1000, value=150, step=10)
-                lno_batch_size = st.number_input("Batch size", min_value=4, max_value=256, value=32, step=4)
-                lno_lr = st.number_input("Learning rate (LNO)", min_value=1e-5, max_value=0.1, value=1e-3, format="%.5f")
-            with train_col2:
-                lno_d_model = st.number_input("Latent size (d_model)", min_value=8, max_value=256, value=64, step=8)
-                lno_blocks = st.number_input("LNO Blocks", min_value=1, max_value=12, value=6, step=1)
-                lno_modes = st.number_input("Laplace/Fourier modes", min_value=4, max_value=256, value=64, step=8)
-            with train_col3:
-                lno_mlp_hidden = st.number_input("Pointwise hidden size", min_value=8, max_value=512, value=128, step=8)
-                lno_train_frac = st.number_input("Train fraction", min_value=0.1, max_value=0.95, value=0.80, step=0.05)
-                lno_weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1e-2, value=1e-4, format="%.5f")
+                    lno_fig = create_lno_training_figure(
+                        ep_list, tr_list, te_list, t_pred, G_lno, P_lno, G_ref_lno, P_ref_lno,
+                    )
+                    lno_chart.pyplot(lno_fig)
+                    plt.close(lno_fig)
 
-        train_lno_btn = st.button("Train LNO Model", type="primary", disabled=not (os.path.exists("ic_samples.npy") and os.path.exists("trajectories.npy")))
+            lno_status.success(f"LNO training complete — {int(lno_epochs):,} epochs. Final test MSE: {te_list[-1]:.3e}")
 
-        if train_lno_btn:
-            # Build hyper-parameters dict
-            hp = {
-                "n_timesteps": int(n_steps) if os.path.exists("trajectories.npy") else 501,
-                "n_species": 2,
-                "train_frac": float(lno_train_frac),
-                "batch_size": int(lno_batch_size),
-                "d_model": int(lno_d_model),
-                "n_lno_blocks": int(lno_blocks),
-                "n_modes": int(lno_modes),
-                "mlp_hidden": int(lno_mlp_hidden),
-                "lifting_layers": 2,
-                "proj_layers": 2,
-                "epochs": int(lno_epochs),
-                "lr": float(lno_lr),
-                "lr_patience": 15,
-                "lr_factor": 0.5,
-                "weight_decay": float(lno_weight_decay),
-                "model_path": "lno_genetic_switch.pt",
-                "plot_path": "lno_prediction_comparison.png",
-                "ic_path": "ic_samples.npy",
-                "traj_path": "trajectories.npy",
+            st.session_state["lno_result"] = {
+                "model_state": lno_model.state_dict(),
+                "norm_stats": norm_stats, "t_norm": t_norm,
+                "hp": {"T": int(lno_timesteps), "d_model": int(lno_d_model),
+                       "n_lno_blocks": int(lno_blocks), "n_modes": int(lno_modes),
+                       "mlp_hidden": int(lno_d_model)*2, "d_enc": max(32, int(lno_d_model)//2)},
+                "epochs": ep_list, "train_losses": tr_list, "test_losses": te_list,
             }
 
-            # Setup training UI
-            status_p = st.empty()
-            progress_b = st.progress(0.0)
-
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            train_loader, test_loader, norm_stats, t_grid = load_lno_data(hp)
-            
-            # Update n_timesteps from loaded data
-            hp["n_timesteps"] = len(t_grid)
-            
-            model = build_lno(hp)
-
-            with st.spinner("Training Laplace Neural Operator..."):
-                train_losses, test_losses = train_lno(
-                    model, train_loader, test_loader, t_grid, hp, device,
-                    status_placeholder=status_p, progress_bar=progress_b
-                )
-                fig_comp = evaluate_lno_and_plot(model, test_loader, t_grid, norm_stats, hp, device)
-                st.session_state["lno_result"] = {
-                    "train_losses": train_losses,
-                    "test_losses": test_losses,
-                    "plot_path": hp["plot_path"]
-                }
-                st.success("LNO training finished and model saved!")
-
-        if "lno_result" in st.session_state:
+        elif "lno_result" in st.session_state:
             res = st.session_state["lno_result"]
-            st.subheader("LNO Performance and Comparison")
-            if os.path.exists(res["plot_path"]):
-                st.image(res["plot_path"], caption="LNO Prediction vs BDF Ground Truth on Test Sample")
+            st.info("Showing the most recent trained LNO. Press **Train LNO** to retrain.")
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            hp = res["hp"]
+            lno_model = LaplaceNeuralOperator(
+                T=hp["T"], d_model=hp["d_model"], n_lno_blocks=hp["n_lno_blocks"],
+                n_modes=hp["n_modes"], mlp_hidden=hp["mlp_hidden"],
+                lifting_layers=2, proj_layers=2, d_enc=hp["d_enc"],
+            ).to(device)
+            lno_model.load_state_dict(res["model_state"])
 
-            # Training Curves
-            fig, ax = plt.subplots(figsize=(8, 4))
-            fig.patch.set_facecolor("#0d0d1a")
-            ax.set_facecolor("#12122a")
-            epochs_ax = np.arange(1, len(res["train_losses"]) + 1)
-            ax.semilogy(epochs_ax, res["train_losses"], color="#00e5ff", lw=1.8, label="Train MSE")
-            ax.semilogy(epochs_ax, res["test_losses"],  color="#ff4081", lw=1.8, label="Test  MSE")
-            ax.set_xlabel("Epoch", color="#aaaacc")
-            ax.set_ylabel("MSE Loss (log)", color="#aaaacc")
-            ax.set_title("LNO Training Curves", color="white", fontweight="bold")
-            ax.tick_params(colors="#aaaacc")
-            ax.grid(True, color="#1e1e3a", lw=0.6, ls="--")
-            ax.legend(fontsize=9, facecolor="#12122a", labelcolor="white")
-            for sp in ax.spines.values():
-                sp.set_edgecolor("#2a2a50")
-            plt.tight_layout()
-            st.pyplot(fig)
-            plt.close(fig)
+            t_pred, G_lno, P_lno, inf_ms = predict_sample(
+                lno_model, [G0, P0], res["t_norm"], res["norm_stats"], t_end, device,
+            )
+            G_ref_lno = np.interp(t_pred, sol.t, sol.y[0]) if sol.success else np.zeros_like(t_pred)
+            P_ref_lno = np.interp(t_pred, sol.t, sol.y[1]) if sol.success else np.zeros_like(t_pred)
+
+            saved_lno_fig = create_lno_training_figure(
+                res["epochs"], res["train_losses"], res["test_losses"],
+                t_pred, G_lno, P_lno, G_ref_lno, P_ref_lno,
+            )
+            st.pyplot(saved_lno_fig)
+            plt.close(saved_lno_fig)
+            st.metric("Inference time", f"{inf_ms:.1f} ms")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helper: shared relative L2 error computation
+# ═══════════════════════════════════════════════════════════════════════════
+def _relative_l2_error(y_pred, y_ref):
+    """Compute per-step relative L2 error between predicted and reference.
+
+    Parameters
+    ----------
+    y_pred : ndarray [2, T]  — solver output (row 0 = G, row 1 = P)
+    y_ref  : ndarray [2, T]  — reference values at same time points
+
+    Returns
+    -------
+    ndarray [T] — relative L2 error at each time step
+    """
+    ref_norms = np.sqrt(y_ref[0]**2 + y_ref[1]**2)
+    ref_norms = np.where(ref_norms < 1e-15, 1.0, ref_norms)
+    return np.sqrt((y_pred[0] - y_ref[0])**2 + (y_pred[1] - y_ref[1])**2) / ref_norms
+
+
+with tab5:
+    st.header("Benchmarking")
+    bench_num, bench_ml = st.tabs(["Numerical Methods", "Machine Learning"])
+
+    # ── Numerical Benchmarking ───────────────────────────────────────────
+    with bench_num:
+        st.subheader("Numerical Solver Comparison")
+        st.markdown(
+            "Compares all implemented ODE solvers against the SciPy LSODA reference "
+            "using **relative L2 error**. Left panel sweeps step sizes; right panel "
+            "shows per-step error at a single step size."
+        )
+
+        if not sol.success:
+            st.error("Reference solution failed — benchmarking unavailable.")
+        else:
+            implemented = [s for s in ODE_SOLVERS if s.IS_IMPLEMENTED]
+            if not implemented:
+                st.info("No ODE solvers are implemented yet. See CONTRIBUTING.md to add one.")
+            else:
+                bcol1, bcol2 = st.columns(2)
+                with bcol1:
+                    bss_min = st.number_input("Min step size", min_value=0.001, value=0.01, format="%.4f", key="bss_min")
+                    bss_max = st.number_input("Max step size", min_value=0.01, value=min(1.0, t_end / 2), format="%.4f", key="bss_max")
+                    bss_count = st.number_input("Number of step sizes", min_value=2, max_value=30, value=8, step=1, key="bss_count")
+                with bcol2:
+                    bench_dt = st.number_input(
+                        "Step size for per-step plot", min_value=0.001, max_value=float(t_end),
+                        value=min(0.1, float(t_end) / 10), format="%.4f", key="bench_dt",
+                    )
+
+                run_bench = st.button("Run Benchmark", type="primary", key="run_bench_num")
+
+                if run_bench:
+                    colors = plt.cm.tab10.colors
+                    dt_values = np.linspace(bss_min, bss_max, int(bss_count))
+
+                    # ── Left: Step Size Sweep ────────────────────────────
+                    fig_left, ax_left = plt.subplots(figsize=(7, 5))
+                    # ── Right: Per-Step Error ────────────────────────────
+                    fig_right, ax_right = plt.subplots(figsize=(7, 5))
+
+                    summary_rows = []
+
+                    for idx, solver_mod in enumerate(implemented):
+                        c = colors[idx % len(colors)]
+
+                        # Step-size sweep
+                        max_errs_per_h = []
+                        for dt_val in dt_values:
+                            try:
+                                t_s, y_s = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(dt_val))
+                                G_i = np.interp(t_s, sol.t, sol.y[0])
+                                P_i = np.interp(t_s, sol.t, sol.y[1])
+                                errs = _relative_l2_error(y_s, np.array([G_i, P_i]))
+                                max_errs_per_h.append(np.max(errs))
+                            except Exception:
+                                max_errs_per_h.append(np.nan)
+                        max_errs_safe = np.maximum(np.array(max_errs_per_h, dtype=float), 1e-16)
+                        ax_left.semilogy(dt_values, max_errs_safe, 'o-', color=c, linewidth=1.8, label=solver_mod.NAME)
+
+                        # Per-step error at fixed dt (skip t=0 — all methods start exact)
+                        try:
+                            t_s2, y_s2 = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(bench_dt))
+                            G_i2 = np.interp(t_s2, sol.t, sol.y[0])
+                            P_i2 = np.interp(t_s2, sol.t, sol.y[1])
+                            step_errs = _relative_l2_error(y_s2, np.array([G_i2, P_i2]))
+                            step_errs_safe = np.maximum(step_errs[1:], 1e-16)
+                            ax_right.semilogy(t_s2[1:], step_errs_safe, linewidth=1.8, color=c, label=solver_mod.NAME)
+                            summary_rows.append({
+                                "Method": solver_mod.NAME,
+                                "Max Rel. Error": f"{np.max(step_errs[1:]):.3e}",
+                                "Mean Rel. Error": f"{np.mean(step_errs[1:]):.3e}",
+                            })
+                        except Exception as exc:
+                            st.warning(f"{solver_mod.NAME}: {exc}")
+
+                    ax_left.set_xlabel("Step Size (h)")
+                    ax_left.set_ylabel("Max Relative L2 Error (log)")
+                    ax_left.set_title("Error vs Step Size — All Methods")
+                    ax_left.legend(fontsize=8)
+                    ax_left.grid(True, which="both", ls="--", alpha=0.5)
+
+                    ax_right.set_xlabel("Time")
+                    ax_right.set_ylabel("Relative L2 Error (log)")
+                    ax_right.set_title(f"Per-Step Error — All Methods  (h = {bench_dt})")
+                    ax_right.legend(fontsize=8)
+                    ax_right.grid(True, which="both", ls="--", alpha=0.5)
+
+                    col_l, col_r = st.columns(2)
+                    with col_l:
+                        st.pyplot(fig_left)
+                        plt.close(fig_left)
+                    with col_r:
+                        st.pyplot(fig_right)
+                        plt.close(fig_right)
+
+                    if summary_rows:
+                        st.markdown(f"#### Results at h = {bench_dt}")
+                        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # ── ML Benchmarking ──────────────────────────────────────────────────
+    with bench_ml:
+        st.subheader("ML Model Comparison")
+        st.markdown(
+            "Compares trained ML models against the SciPy LSODA reference. "
+            "If no model is trained yet, clicking **Run ML Benchmark** will train "
+            "with the parameters set in the **Machine Learning** tab."
+        )
+
+        if not sol.success:
+            st.error("Reference solution failed — benchmarking unavailable.")
+        else:
+            ml_bench_dt = st.number_input(
+                "Evaluation time resolution", min_value=50, max_value=2000, value=300, step=50, key="ml_bench_res",
+                help="Number of time points to evaluate the ML models at.",
+            )
+
+            run_ml_bench = st.button("Run ML Benchmark", type="primary", key="run_bench_ml")
+
+            if run_ml_bench:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                ml_eval_t = np.linspace(0.0, t_end, int(ml_bench_dt))
+                G_ref_ml = np.interp(ml_eval_t, sol.t, sol.y[0])
+                P_ref_ml = np.interp(ml_eval_t, sol.t, sol.y[1])
+                y_ref_ml = np.array([G_ref_ml, P_ref_ml])
+
+                fig_ml_err, ax_ml_err = plt.subplots(figsize=(7, 5))
+                ml_summary = []
+
+                # ── PINN ─────────────────────────────────────────────
+                if "pinn_result" not in st.session_state:
+                    st.info("No trained PINN found — training one now with sidebar parameters...")
+                    torch.manual_seed(42)
+                    np.random.seed(42)
+                    pinn_model = PINN(t_end=t_end, hidden_layers=3, neurons=32).to(device)
+                    pinn_opt = torch.optim.Adam(pinn_model.parameters(), lr=0.01)
+                    coll_t = torch.linspace(0.0, float(t_end), 200, device=device).reshape(-1, 1)
+                    init_s = torch.tensor([[G0, P0]], dtype=torch.float32, device=device)
+                    pinn_bar = st.progress(0.0, text="Training PINN...")
+                    for ep in range(1, 1001):
+                        pinn_opt.zero_grad()
+                        tl, il, pl = calculate_pinn_loss(pinn_model, coll_t, init_s, p, n, m, 10.0, 1.0)
+                        tl.backward()
+                        torch.nn.utils.clip_grad_norm_(pinn_model.parameters(), max_norm=10.0)
+                        pinn_opt.step()
+                        if ep % 100 == 0:
+                            pinn_bar.progress(ep / 1000, text=f"Training PINN... epoch {ep}/1000")
+                    pinn_bar.empty()
+                    G_pinn, P_pinn = evaluate_pinn(pinn_model, ml_eval_t, device)
+                    st.success("PINN auto-trained (1000 epochs).")
+                else:
+                    pr = st.session_state["pinn_result"]
+                    G_pinn = np.interp(ml_eval_t, pr["t"], pr["G"])
+                    P_pinn = np.interp(ml_eval_t, pr["t"], pr["P"])
+
+                y_pinn = np.array([G_pinn, P_pinn])
+                pinn_errs = _relative_l2_error(y_pinn, y_ref_ml)
+                pinn_errs_safe = np.maximum(pinn_errs, 1e-16)
+                ax_ml_err.semilogy(ml_eval_t, pinn_errs_safe, linewidth=2, label="PINN", color="darkorange")
+                ml_summary.append({"Model": "PINN", "Max Rel. Error": f"{np.max(pinn_errs):.3e}", "Mean Rel. Error": f"{np.mean(pinn_errs):.3e}"})
+
+                # ── LNO ──────────────────────────────────────────────
+                if "lno_result" not in st.session_state:
+                    st.info("No trained LNO found — training one now with sidebar parameters...")
+                    torch.manual_seed(42)
+                    np.random.seed(42)
+                    lno_n_ts = 201
+                    ics_d, traj_d = generate_training_data(p, n, m, t_end, 200, lno_n_ts, seed=42)
+                    tr_ld, te_ld, ns, t_n = prepare_dataloaders(ics_d, traj_d, batch_size=32, seed=42)
+                    t_gd = t_n.to(device)
+                    lno_auto = LaplaceNeuralOperator(
+                        T=lno_n_ts, d_model=64, n_lno_blocks=4, n_modes=32,
+                        mlp_hidden=128, lifting_layers=2, proj_layers=2, d_enc=32,
+                    ).to(device)
+                    lno_opt = torch.optim.Adam(lno_auto.parameters(), lr=1e-3, weight_decay=1e-4)
+                    crit = torch.nn.MSELoss()
+                    lno_bar = st.progress(0.0, text="Training LNO...")
+                    for ep in range(1, 101):
+                        train_one_epoch(lno_auto, tr_ld, lno_opt, crit, t_gd, device)
+                        if ep % 10 == 0:
+                            lno_bar.progress(ep / 100, text=f"Training LNO... epoch {ep}/100")
+                    lno_bar.empty()
+                    st.success("LNO auto-trained (100 epochs on 200 samples).")
+                    t_lno_b, G_lno_b, P_lno_b, _ = predict_sample(lno_auto, [G0, P0], t_n, ns, t_end, device)
+                else:
+                    res = st.session_state["lno_result"]
+                    hp = res["hp"]
+                    lno_auto = LaplaceNeuralOperator(
+                        T=hp["T"], d_model=hp["d_model"], n_lno_blocks=hp["n_lno_blocks"],
+                        n_modes=hp["n_modes"], mlp_hidden=hp["mlp_hidden"],
+                        lifting_layers=2, proj_layers=2, d_enc=hp["d_enc"],
+                    ).to(device)
+                    lno_auto.load_state_dict(res["model_state"])
+                    t_lno_b, G_lno_b, P_lno_b, _ = predict_sample(lno_auto, [G0, P0], res["t_norm"], res["norm_stats"], t_end, device)
+
+                G_lno_interp = np.interp(ml_eval_t, t_lno_b, G_lno_b)
+                P_lno_interp = np.interp(ml_eval_t, t_lno_b, P_lno_b)
+                y_lno = np.array([G_lno_interp, P_lno_interp])
+                lno_errs = _relative_l2_error(y_lno, y_ref_ml)
+                lno_errs_safe = np.maximum(lno_errs, 1e-16)
+                ax_ml_err.semilogy(ml_eval_t, lno_errs_safe, linewidth=2, label="LNO", color="mediumseagreen")
+                ml_summary.append({"Model": "LNO", "Max Rel. Error": f"{np.max(lno_errs):.3e}", "Mean Rel. Error": f"{np.mean(lno_errs):.3e}"})
+
+                ax_ml_err.set_xlabel("Time")
+                ax_ml_err.set_ylabel("Relative L2 Error (log)")
+                ax_ml_err.set_title("ML Per-Step Error — PINN vs LNO")
+                ax_ml_err.legend(fontsize=9)
+                ax_ml_err.grid(True, which="both", ls="--", alpha=0.5)
+
+                st.pyplot(fig_ml_err)
+                plt.close(fig_ml_err)
+
+                st.markdown("#### Results")
+                st.dataframe(pd.DataFrame(ml_summary), use_container_width=True, hide_index=True)
+

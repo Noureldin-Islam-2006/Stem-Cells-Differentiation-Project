@@ -1,6 +1,6 @@
 # PU.1/GATA-1 Gene Regulatory Network Simulation
 
-An interactive Streamlit application for simulating the **PU.1/GATA-1 gene regulatory network** that governs hematopoietic stem cell differentiation. The project implements and compares multiple numerical ODE solvers and a Physics-Informed Neural Network (PINN), with built-in convergence analysis tools.
+An interactive Streamlit application for simulating the **PU.1/GATA-1 gene regulatory network** that governs hematopoietic stem cell differentiation. The project implements and compares multiple numerical ODE solvers and machine learning approaches (PINN and Laplace Neural Operator), with built-in convergence analysis and benchmarking tools.
 
 Based on the mathematical model from **Schiesser (2014), Chapter 5** — equations 5.1a and 5.1b.
 
@@ -23,7 +23,7 @@ Each equation has three terms:
 
 ## Features
 
-### System Dynamics
+### 1. System Dynamics
 Solve the ODE system and visualize protein concentrations over time using any of the available numerical methods:
 
 | Method | Type | Order | Description |
@@ -33,30 +33,51 @@ Solve the ODE system and visualize protein concentrations over time using any of
 | **Backward Euler** | Implicit | 1st | Implicit Euler with Newton iteration (via `fsolve`) |
 | **Runge-Kutta (RK4)** | Explicit | 4th | Classical 4-stage method |
 | **BDF** | Implicit | Multi-step | Backward differentiation formula for stiff systems |
-| **Adams-Bashforth** | Explicit | Multi-step | Uses previous evaluations to extrapolate |
+| **Adams-Bashforth** | Explicit | Multi-step | 2-step method bootstrapped with RK4 |
 | **Heun's Method** | Explicit | 2nd | Predictor-corrector (improved Euler) |
 
 Each method has its own tab with configurable step size and automatic overlay of the SciPy reference solution.
 
-### Phase Plane & Steady States
+### 2. Phase Plane & Steady States
 - **Nullcline visualization** — curves where dG/dt = 0 and dP/dt = 0
 - **Vector field** — streamlines showing system trajectories
 - **Newton-Raphson root finder** — iteratively locates steady states with visual path tracking
 
-### Convergence Analysis
-Compare solver accuracy with two configurable error plots:
-- **Step Size Error** — max L2 error vs. step size *h* (sweep multiple values)
-- **Iteration Error** — per-step L2 error vs. time for a given *h*
-- **Newton-Raphson** — residual norm per iteration with adjustable tolerance and max iterations
+### 3. Convergence Analysis
+Compare solver accuracy using **relative L2 error** against the SciPy reference:
 
-All plots use linear scale. Step sizes, tolerances, and iteration limits are adjustable through the UI.
+- **Newton-Raphson**: Tolerance sweep (error vs. tolerance) and per-iteration relative error — matching the same two-panel layout as the ODE solvers
+- **ODE Solvers**: Step-size error (max relative error vs. *h*) and per-step error vs. time for a given *h*
 
-### Physics-Informed Neural Network (PINN)
-Train a neural network to learn G(t) and P(t) using the ODEs as physics constraints — no labelled data required:
+All error metrics use the same relative L2 formula: `||y_pred - y_ref||₂ / ||y_ref||₂`
+
+### 4. Machine Learning
+
+Two ML approaches for solving the gene regulatory network:
+
+#### Physics-Informed Neural Network (PINN)
+Train a neural network to learn G(t) and P(t) using the ODEs as physics constraints — **no labelled data required**:
 - Live training visualization with loss curves and prediction updates
 - Configurable architecture (layers, neurons, learning rate, epochs)
+- Decomposed loss: IC loss + physics residual loss with adjustable weights
 - Comparison against the ODE reference solution
-- Supports GPU acceleration when available
+
+#### Laplace Neural Operator (LNO)
+A **data-driven** neural operator that maps initial conditions → full trajectories by learning in the Laplace/frequency domain:
+- Trains on pre-generated BDF trajectories from random initial conditions
+- Architecture: IC lifting MLP → sinusoidal temporal encoding → N × LNO blocks (FFT-based frequency mixing + pointwise MLP bypass + LayerNorm) → projection MLP
+- Performs **instant inference** (~1 ms) for any new initial condition after training
+- Configurable: d_model, number of blocks, Fourier modes, training samples, epochs
+
+Both methods support GPU acceleration when available.
+
+### 5. Benchmarking
+A dedicated tab for head-to-head comparisons:
+
+- **Numerical Methods**: Runs all implemented ODE solvers and overlays their relative L2 error on two shared plots — step-size sweep (max error vs. *h*) and per-step error at a fixed *h*. Produces a summary table.
+- **Machine Learning**: Compares PINN vs. LNO against the reference solution. If no models are trained, they are **auto-trained** with default parameters directly from the benchmarking tab.
+
+Both sub-tabs use the same relative L2 error metric for consistent comparison.
 
 ### Parameter Presets
 Two built-in presets from the textbook:
@@ -70,7 +91,7 @@ All 12 model parameters are individually adjustable via the sidebar.
 ## Project Structure
 
 ```
-├── app.py                             # Streamlit UI (imports from solvers/)
+├── app.py                             # Streamlit UI (5 tabs + subtabs)
 ├── requirements.txt
 ├── CONTRIBUTING.md                    # Guide for adding new solvers
 │
@@ -79,30 +100,41 @@ All 12 model parameters are individually adjustable via the sidebar.
     │
     ├── numerical/
     │   ├── __init__.py                # Solver registry (ODE_SOLVERS list)
+    │   ├── registry.py                # Auto-discovery of solver modules
     │   ├── newton/solver.py           # Newton-Raphson root finder
     │   ├── euler/solver.py            # Forward Euler
     │   ├── backward_euler/solver.py   # Implicit Euler (fsolve)
     │   ├── runge_kutta/solver.py      # Classical RK4
     │   ├── bdf/solver.py              # Backward Differentiation Formula
-    │   ├── adams_bashforth/solver.py  # Adams-Bashforth multi-step
+    │   ├── adams_bashforth/solver.py  # Adams-Bashforth (AB2, RK4 bootstrap)
     │   └── heun/solver.py             # Heun's method (improved Euler)
     │
     └── ml/
-        └── pinn/
-            ├── model.py               # PINN architecture (nn.Module)
-            ├── loss.py                # Physics-informed loss functions
-            └── utils.py               # Evaluation & visualization
+        ├── pinn/
+        │   ├── model.py               # PINN architecture (nn.Module)
+        │   ├── loss.py                # Physics-informed loss functions
+        │   └── utils.py               # Evaluation & visualization
+        │
+        └── lno/
+            ├── model.py               # LNO architecture (frequency-domain blocks)
+            ├── data.py                # BDF trajectory generation & normalization
+            ├── training.py            # Training loop & inference
+            └── utils.py               # Visualization helpers
 ```
 
 ### Architecture
 
-The app is designed around a **solver registry** pattern. All ODE solvers expose the same interface:
+The app is designed around two registry patterns:
 
+**Numerical solvers** expose a uniform interface:
 ```python
 def solve(ode_func, t_span, y0, args, dt) -> (t, y)
 ```
-
 The UI iterates over the `ODE_SOLVERS` list in `solvers/numerical/__init__.py` to generate tabs and convergence analysis automatically. Adding a new solver requires zero changes to `app.py` — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+**ML solvers** are organized as sub-packages under `solvers/ml/`, each with their own model, training, and utility modules. The Streamlit UI provides dedicated sub-tabs for each ML approach.
+
+**Shared error metric** — a single `_relative_l2_error()` function is used across convergence analysis and benchmarking for consistent comparison between all methods (numerical and ML).
 
 ---
 
@@ -137,7 +169,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for instructions on adding new numerical 
 
 1. Implement `solve()` in `solvers/numerical/<method>/solver.py`
 2. Set `IS_IMPLEMENTED = True`
-3. The UI picks it up automatically
+3. The UI picks it up automatically — no changes to `app.py` needed
 
 ---
 

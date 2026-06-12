@@ -1,17 +1,16 @@
-"""Laplace Neural Operator (LNO) package."""
+"""Laplace Neural Operator solver."""
 
-from solvers.ml.lno.model import LaplaceNeuralOperator, build_model
-from solvers.ml.lno.data_generation import generate_dataset, plot_dataset_samples, PARAMS, genetic_switch
-from solvers.ml.lno.train import load_data, train, evaluate_and_plot
+from solvers.ml.lno.model import LaplaceNeuralOperator
+from solvers.ml.lno.data import generate_training_data, prepare_dataloaders
+from solvers.ml.lno.training import train_one_epoch, evaluate, predict_sample
+from solvers.ml.lno.utils import create_lno_training_figure
 
 __all__ = [
     "LaplaceNeuralOperator",
-    "build_model",
-    "generate_dataset",
-    "plot_dataset_samples",
-    "PARAMS",
-    "genetic_switch",
-    "load_data",
-    "train",
-    "evaluate_and_plot",
+    "generate_training_data",
+    "prepare_dataloaders",
+    "train_one_epoch",
+    "evaluate",
+    "predict_sample",
+    "create_lno_training_figure",
 ]

@@ -66,7 +66,7 @@ t_span = (0, t_end)
 t_eval = np.linspace(0, t_end, max(1000, int(t_end*10)))
 sol = solve_ivp(ode_system, t_span, [G0, P0], args=(p, n, m), t_eval=t_eval, method='LSODA')
 
-# 2. Main Panel (Tabs)
+# 3. Main Panel (Tabs)
 tab1, tab2, tab3, tab4 = st.tabs(["System Dynamics", "Phase Plane & Steady States", "Convergence Analysis", "Machine Learning"])
 
 with tab1:
@@ -88,7 +88,7 @@ with tab1:
             ax1.legend()
             ax1.grid(True)
             st.pyplot(fig1)
-            
+
             g1, g2, g3, p1, p2, p3 = calculate_terms(sol.y[0], sol.y[1], p, n, m)
             st.subheader("Component Breakdown")
             col1, col2 = st.columns(2)
@@ -104,7 +104,6 @@ with tab1:
                 ax2.legend()
                 ax2.grid(True)
                 st.pyplot(fig2)
-                
             with col2:
                 fig3, ax3 = plt.subplots(figsize=(6, 4))
                 ax3.plot(sol.t, p1, label='Auto-activation', color='darkblue', linestyle='--')
@@ -221,7 +220,7 @@ with tab2:
 
 with tab3:
     st.header("Convergence Analysis")
-    
+
     # Build method list: Newton + implemented ODE solvers
     conv_methods = ["Newton-Raphson"] + [s.NAME for s in ODE_SOLVERS if s.IS_IMPLEMENTED]
     selected_conv = st.selectbox("Method to analyse", conv_methods, key="conv_method")

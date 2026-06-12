@@ -29,6 +29,7 @@ Solve the ODE system and visualize protein concentrations over time using any of
 | Method | Type | Order | Description |
 |--------|------|-------|-------------|
 | **Reference (SciPy)** | Adaptive | Variable | LSODA with automatic stiffness detection |
+| **LSODA (Schiesser)** | Adaptive | Variable | Book's original R solver translated to Python, with 4-panel derivative analysis |
 | **Euler's Method** | Explicit | 1st | Forward Euler — simplest time-stepping scheme |
 | **Backward Euler** | Implicit | 1st | Implicit Euler with Newton iteration (via `fsolve`) |
 | **Runge-Kutta (RK4)** | Explicit | 4th | Classical 4-stage method |
@@ -36,7 +37,7 @@ Solve the ODE system and visualize protein concentrations over time using any of
 | **Adams-Bashforth** | Explicit | Multi-step | 2-step method bootstrapped with RK4 |
 | **Heun's Method** | Explicit | 2nd | Predictor-corrector (improved Euler) |
 
-Each method has its own tab with configurable step size and automatic overlay of the SciPy reference solution.
+Each method has its own tab with configurable step size and automatic overlay of the SciPy reference solution. The **LSODA (Schiesser)** tab additionally provides the book's 4-panel derivative plot (G, P, dG/dt, dP/dt) and a numerical output table matching the original R console output.
 
 ### 2. Phase Plane & Steady States
 - **Nullcline visualization** — curves where dG/dt = 0 and dP/dt = 0

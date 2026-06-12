@@ -16,6 +16,15 @@ from solvers.ml.pinn import (
     evaluate_pinn,
     create_live_training_figure,
 )
+from solvers.ml.lno import (
+    build_model as build_lno,
+    generate_dataset as generate_lno_dataset,
+    plot_dataset_samples as plot_lno_dataset_samples,
+    load_data as load_lno_data,
+    train as train_lno,
+    evaluate_and_plot as evaluate_lno_and_plot,
+)
+import os
 
 # --- Streamlit UI Architecture ---
 
@@ -308,236 +317,376 @@ with tab3:
                     st.error(f"Solver error: {exc}")
 
 with tab4:
-    st.header("Physics-Informed Neural Network")
-    st.markdown(
-        "Train a neural network to predict **GATA-1** and **PU.1** while the "
-        "gene-regulation ODEs act as its training constraints. The dashed curves "
-        "are shown only as a reference and are not used as training labels."
-    )
+    st.header("Machine Learning Solvers")
+    ml_subtab1, ml_subtab2 = st.tabs(["Physics-Informed Neural Network (PINN)", "Laplace Neural Operator (LNO)"])
 
-    if not sol.success:
-        st.error("The reference ODE solution failed, so PINN comparison is unavailable.")
-    elif t_end <= 0:
-        st.error("Time Span must be greater than zero before training the PINN.")
-    elif min(G0, P0) < 0:
-        st.error("PINN training requires non-negative initial concentrations.")
-    elif min(p['tha1'], p['tha2'], p['thb1'], p['thb2'], n, m) <= 0:
-        st.error(
-            "Hill thresholds and Hill coefficients must be greater than zero "
-            "before training the PINN."
-        )
-    else:
-        with st.expander("PINN Training Parameters", expanded=True):
-            ml_col1, ml_col2, ml_col3 = st.columns(3)
-            with ml_col1:
-                pinn_epochs = st.number_input(
-                    "Epochs", min_value=1, max_value=50000, value=1000, step=100
-                )
-                pinn_learning_rate = st.number_input(
-                    "Learning rate",
-                    min_value=0.000001,
-                    max_value=0.1,
-                    value=0.01,
-                    format="%.6f",
-                )
-                pinn_collocation = st.number_input(
-                    "Collocation points",
-                    min_value=10,
-                    max_value=5000,
-                    value=200,
-                    step=10,
-                )
-            with ml_col2:
-                pinn_layers = st.number_input(
-                    "Hidden layers", min_value=1, max_value=10, value=3, step=1
-                )
-                pinn_neurons = st.number_input(
-                    "Neurons per layer",
-                    min_value=4,
-                    max_value=512,
-                    value=32,
-                    step=4,
-                )
-                pinn_seed = st.number_input(
-                    "Random seed", min_value=0, max_value=100000, value=42, step=1
-                )
-            with ml_col3:
-                pinn_ic_weight = st.number_input(
-                    "Initial-condition loss weight",
-                    min_value=0.0,
-                    max_value=10000.0,
-                    value=10.0,
-                    format="%.2f",
-                )
-                pinn_physics_weight = st.number_input(
-                    "Physics loss weight",
-                    min_value=0.0,
-                    max_value=10000.0,
-                    value=1.0,
-                    format="%.2f",
-                )
-                pinn_update_every = st.number_input(
-                    "Live update every N epochs",
-                    min_value=1,
-                    max_value=50000,
-                    value=min(10, int(pinn_epochs)),
-                    step=1,
-                    help="Set to 1 to watch every epoch. Larger values train faster.",
-                )
-
-        train_pinn = st.button(
-            "Train PINN",
-            type="primary",
-            help="Training runs in this page and updates the charts as it learns.",
+    with ml_subtab1:
+        st.subheader("Physics-Informed Neural Network")
+        st.markdown(
+            "Train a neural network to predict **GATA-1** and **PU.1** while the "
+            "gene-regulation ODEs act as its training constraints. The dashed curves "
+            "are shown only as a reference and are not used as training labels."
         )
 
-        if train_pinn:
-            torch.manual_seed(int(pinn_seed))
-            np.random.seed(int(pinn_seed))
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if not sol.success:
+            st.error("The reference ODE solution failed, so PINN comparison is unavailable.")
+        elif t_end <= 0:
+            st.error("Time Span must be greater than zero before training the PINN.")
+        elif min(G0, P0) < 0:
+            st.error("PINN training requires non-negative initial concentrations.")
+        elif min(p['tha1'], p['tha2'], p['thb1'], p['thb2'], n, m) <= 0:
+            st.error(
+                "Hill thresholds and Hill coefficients must be greater than zero "
+                "before training the PINN."
+            )
+        else:
+            with st.expander("PINN Training Parameters", expanded=True):
+                ml_col1, ml_col2, ml_col3 = st.columns(3)
+                with ml_col1:
+                    pinn_epochs = st.number_input(
+                        "Epochs", min_value=1, max_value=50000, value=1000, step=100
+                    )
+                    pinn_learning_rate = st.number_input(
+                        "Learning rate",
+                        min_value=0.000001,
+                        max_value=0.1,
+                        value=0.01,
+                        format="%.6f",
+                    )
+                    pinn_collocation = st.number_input(
+                        "Collocation points",
+                        min_value=10,
+                        max_value=5000,
+                        value=200,
+                        step=10,
+                    )
+                with ml_col2:
+                    pinn_layers = st.number_input(
+                        "Hidden layers", min_value=1, max_value=10, value=3, step=1
+                    )
+                    pinn_neurons = st.number_input(
+                        "Neurons per layer",
+                        min_value=4,
+                        max_value=512,
+                        value=32,
+                        step=4,
+                    )
+                    pinn_seed = st.number_input(
+                        "Random seed", min_value=0, max_value=100000, value=42, step=1
+                    )
+                with ml_col3:
+                    pinn_ic_weight = st.number_input(
+                        "Initial-condition loss weight",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=10.0,
+                        format="%.2f",
+                    )
+                    pinn_physics_weight = st.number_input(
+                        "Physics loss weight",
+                        min_value=0.0,
+                        max_value=10000.0,
+                        value=1.0,
+                        format="%.2f",
+                    )
+                    pinn_update_every = st.number_input(
+                        "Live update every N epochs",
+                        min_value=1,
+                        max_value=50000,
+                        value=min(10, int(pinn_epochs)),
+                        step=1,
+                        help="Set to 1 to watch every epoch. Larger values train faster.",
+                    )
 
-            model = PINN(
-                t_end=t_end,
-                hidden_layers=int(pinn_layers),
-                neurons=int(pinn_neurons),
-            ).to(device)
-            optimizer = torch.optim.Adam(
-                model.parameters(), lr=float(pinn_learning_rate)
+            train_pinn = st.button(
+                "Train PINN",
+                type="primary",
+                help="Training runs in this page and updates the charts as it learns.",
             )
 
-            collocation_t = torch.linspace(
-                0.0,
-                float(t_end),
-                int(pinn_collocation),
-                device=device,
-            ).reshape(-1, 1)
-            initial_state = torch.tensor(
-                [[G0, P0]], dtype=torch.float32, device=device
-            )
+            if train_pinn:
+                torch.manual_seed(int(pinn_seed))
+                np.random.seed(int(pinn_seed))
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-            plot_t = np.linspace(0.0, t_end, 300)
-            G_reference = np.interp(plot_t, sol.t, sol.y[0])
-            P_reference = np.interp(plot_t, sol.t, sol.y[1])
-
-            status_placeholder = st.empty()
-            progress_bar = st.progress(0.0)
-            metric_cols = st.columns(4)
-            total_metric = metric_cols[0].empty()
-            physics_metric = metric_cols[1].empty()
-            ic_metric = metric_cols[2].empty()
-            mse_metric = metric_cols[3].empty()
-            chart_placeholder = st.empty()
-
-            epochs_seen = []
-            total_losses = []
-            ic_losses = []
-            physics_losses = []
-            mse_history = []
-
-            for epoch in range(1, int(pinn_epochs) + 1):
-                optimizer.zero_grad()
-                total_loss, ic_loss, physics_loss = calculate_pinn_loss(
-                    model,
-                    collocation_t,
-                    initial_state,
-                    p,
-                    n,
-                    m,
-                    float(pinn_ic_weight),
-                    float(pinn_physics_weight),
+                model = PINN(
+                    t_end=t_end,
+                    hidden_layers=int(pinn_layers),
+                    neurons=int(pinn_neurons),
+                ).to(device)
+                optimizer = torch.optim.Adam(
+                    model.parameters(), lr=float(pinn_learning_rate)
                 )
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
-                optimizer.step()
 
-                should_update = (
-                    epoch == 1
-                    or epoch % int(pinn_update_every) == 0
-                    or epoch == int(pinn_epochs)
+                collocation_t = torch.linspace(
+                    0.0,
+                    float(t_end),
+                    int(pinn_collocation),
+                    device=device,
+                ).reshape(-1, 1)
+                initial_state = torch.tensor(
+                    [[G0, P0]], dtype=torch.float32, device=device
                 )
-                if should_update:
-                    G_pred, P_pred = evaluate_pinn(model, plot_t, device)
-                    prediction_mse = float(
-                        np.mean((G_pred - G_reference) ** 2)
-                        + np.mean((P_pred - P_reference) ** 2)
-                    )
 
-                    epochs_seen.append(epoch)
-                    total_losses.append(float(total_loss.detach().cpu()))
-                    ic_losses.append(float(ic_loss.detach().cpu()))
-                    physics_losses.append(float(physics_loss.detach().cpu()))
-                    mse_history.append(prediction_mse)
+                plot_t = np.linspace(0.0, t_end, 300)
+                G_reference = np.interp(plot_t, sol.t, sol.y[0])
+                P_reference = np.interp(plot_t, sol.t, sol.y[1])
 
-                    status_placeholder.write(
-                        f"Training on **{device.type.upper()}**: epoch "
-                        f"**{epoch:,} / {int(pinn_epochs):,}**"
-                    )
-                    progress_bar.progress(epoch / int(pinn_epochs))
-                    total_metric.metric("Total loss", f"{total_losses[-1]:.3e}")
-                    physics_metric.metric(
-                        "Physics loss", f"{physics_losses[-1]:.3e}"
-                    )
-                    ic_metric.metric("IC loss", f"{ic_losses[-1]:.3e}")
-                    mse_improvement = (
-                        0.0
-                        if mse_history[0] == 0
-                        else 100.0 * (mse_history[0] - prediction_mse) / mse_history[0]
-                    )
-                    mse_metric.metric(
-                        "ODE comparison MSE",
-                        f"{prediction_mse:.3e}",
-                        delta=f"{mse_improvement:.1f}% vs epoch 1",
-                    )
+                status_placeholder = st.empty()
+                progress_bar = st.progress(0.0)
+                metric_cols = st.columns(4)
+                total_metric = metric_cols[0].empty()
+                physics_metric = metric_cols[1].empty()
+                ic_metric = metric_cols[2].empty()
+                mse_metric = metric_cols[3].empty()
+                chart_placeholder = st.empty()
 
-                    live_figure = create_live_training_figure(
-                        epochs_seen,
-                        total_losses,
-                        ic_losses,
-                        physics_losses,
-                        plot_t,
-                        G_pred,
-                        P_pred,
-                        G_reference,
-                        P_reference,
-                    )
-                    chart_placeholder.pyplot(live_figure)
-                    plt.close(live_figure)
+                epochs_seen = []
+                total_losses = []
+                ic_losses = []
+                physics_losses = []
+                mse_history = []
 
-            st.session_state["pinn_result"] = {
-                "t": plot_t,
-                "G": G_pred,
-                "P": P_pred,
-                "G_reference": G_reference,
-                "P_reference": P_reference,
-                "epochs": epochs_seen,
-                "total_losses": total_losses,
-                "ic_losses": ic_losses,
-                "physics_losses": physics_losses,
-                "mse_history": mse_history,
-                "device": device.type,
+                for epoch in range(1, int(pinn_epochs) + 1):
+                    optimizer.zero_grad()
+                    total_loss, ic_loss, physics_loss = calculate_pinn_loss(
+                        model,
+                        collocation_t,
+                        initial_state,
+                        p,
+                        n,
+                        m,
+                        float(pinn_ic_weight),
+                        float(pinn_physics_weight),
+                    )
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+                    optimizer.step()
+
+                    should_update = (
+                        epoch == 1
+                        or epoch % int(pinn_update_every) == 0
+                        or epoch == int(pinn_epochs)
+                    )
+                    if should_update:
+                        G_pred, P_pred = evaluate_pinn(model, plot_t, device)
+                        prediction_mse = float(
+                            np.mean((G_pred - G_reference) ** 2)
+                            + np.mean((P_pred - P_reference) ** 2)
+                        )
+
+                        epochs_seen.append(epoch)
+                        total_losses.append(float(total_loss.detach().cpu()))
+                        ic_losses.append(float(ic_loss.detach().cpu()))
+                        physics_losses.append(float(physics_loss.detach().cpu()))
+                        mse_history.append(prediction_mse)
+
+                        status_placeholder.write(
+                            f"Training on **{device.type.upper()}**: epoch "
+                            f"**{epoch:,} / {int(pinn_epochs):,}**"
+                        )
+                        progress_bar.progress(epoch / int(pinn_epochs))
+                        total_metric.metric("Total loss", f"{total_losses[-1]:.3e}")
+                        physics_metric.metric(
+                            "Physics loss", f"{physics_losses[-1]:.3e}"
+                        )
+                        ic_metric.metric("IC loss", f"{ic_losses[-1]:.3e}")
+                        mse_improvement = (
+                            0.0
+                            if mse_history[0] == 0
+                            else 100.0 * (mse_history[0] - prediction_mse) / mse_history[0]
+                        )
+                        mse_metric.metric(
+                            "ODE comparison MSE",
+                            f"{prediction_mse:.3e}",
+                            delta=f"{mse_improvement:.1f}% vs epoch 1",
+                        )
+
+                        live_figure = create_live_training_figure(
+                            epochs_seen,
+                            total_losses,
+                            ic_losses,
+                            physics_losses,
+                            plot_t,
+                            G_pred,
+                            P_pred,
+                            G_reference,
+                            P_reference,
+                        )
+                        chart_placeholder.pyplot(live_figure)
+                        plt.close(live_figure)
+
+                st.session_state["pinn_result"] = {
+                    "t": plot_t,
+                    "G": G_pred,
+                    "P": P_pred,
+                    "G_reference": G_reference,
+                    "P_reference": P_reference,
+                    "epochs": epochs_seen,
+                    "total_losses": total_losses,
+                    "ic_losses": ic_losses,
+                    "physics_losses": physics_losses,
+                    "mse_history": mse_history,
+                    "device": device.type,
+                }
+                status_placeholder.success(
+                    f"Training complete after {int(pinn_epochs):,} epochs on "
+                    f"{device.type.upper()}. Final comparison MSE: {mse_history[-1]:.3e}"
+                )
+
+            elif "pinn_result" in st.session_state:
+                result = st.session_state["pinn_result"]
+                st.info(
+                    "Showing the most recent trained PINN. Press **Train PINN** to "
+                    "retrain it with the current parameters."
+                )
+                saved_figure = create_live_training_figure(
+                    result["epochs"],
+                    result["total_losses"],
+                    result["ic_losses"],
+                    result["physics_losses"],
+                    result["t"],
+                    result["G"],
+                    result["P"],
+                    result["G_reference"],
+                    result["P_reference"],
+                )
+                st.pyplot(saved_figure)
+                plt.close(saved_figure)
+                st.metric("Final ODE comparison MSE", f"{result['mse_history'][-1]:.3e}")
+
+    with ml_subtab2:
+        st.subheader("Laplace Neural Operator")
+        st.markdown(
+            "The Laplace Neural Operator (LNO) maps initial conditions directly to full trajectories "
+            "by learning linear operations in the Laplace frequency domain. This architecture naturally "
+            "handles stiffness through damping parameters in the frequency domain."
+        )
+
+        ic_exists = os.path.exists("ic_samples.npy")
+        traj_exists = os.path.exists("trajectories.npy")
+
+        # 1. Dataset Generation
+        with st.expander("Dataset Generation (Stiff BDF Trajectories)", expanded=not (ic_exists and traj_exists)):
+            st.markdown("Generate trajectory samples using scipy's stiff BDF solver to train the LNO.")
+            gen_col1, gen_col2 = st.columns(2)
+            with gen_col1:
+                n_traj = st.number_input("Number of trajectories", min_value=10, max_value=5000, value=1000, step=100)
+                t_end_gen = st.number_input("Time end (t_end)", min_value=1.0, max_value=100.0, value=10.0, step=1.0)
+            with gen_col2:
+                n_steps = st.number_input("Time steps per trajectory", min_value=10, max_value=2000, value=501, step=50)
+                ic_range_max = st.number_input("Max initial concentration", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
+
+            generate_btn = st.button("Generate Dataset", type="secondary")
+            if generate_btn:
+                with st.spinner("Generating trajectories using scipy BDF solver..."):
+                    ics, trajs, t_eval = generate_lno_dataset(
+                        n_traj=int(n_traj),
+                        t_end=float(t_end_gen),
+                        n_steps=int(n_steps),
+                        ic_range=(0.0, float(ic_range_max)),
+                        seed=42,
+                        ic_path="ic_samples.npy",
+                        traj_path="trajectories.npy",
+                    )
+                    plot_lno_dataset_samples(ics, trajs, t_eval, n_show=12, out_path="dataset_samples.png")
+                    st.success("Successfully generated dataset!")
+                    st.image("dataset_samples.png", caption="Generated Dataset Trajectory Samples")
+
+        # Show if dataset files exist
+        if os.path.exists("ic_samples.npy") and os.path.exists("trajectories.npy"):
+            st.info("✅ Dataset files (`ic_samples.npy`, `trajectories.npy`) exist. Ready to train.")
+        else:
+            st.warning("⚠️ No dataset files found. Please generate the dataset before training.")
+
+        # 2. LNO Training
+        with st.expander("LNO Hyperparameters & Architecture", expanded=True):
+            train_col1, train_col2, train_col3 = st.columns(3)
+            with train_col1:
+                lno_epochs = st.number_input("LNO Epochs", min_value=1, max_value=1000, value=150, step=10)
+                lno_batch_size = st.number_input("Batch size", min_value=4, max_value=256, value=32, step=4)
+                lno_lr = st.number_input("Learning rate (LNO)", min_value=1e-5, max_value=0.1, value=1e-3, format="%.5f")
+            with train_col2:
+                lno_d_model = st.number_input("Latent size (d_model)", min_value=8, max_value=256, value=64, step=8)
+                lno_blocks = st.number_input("LNO Blocks", min_value=1, max_value=12, value=6, step=1)
+                lno_modes = st.number_input("Laplace/Fourier modes", min_value=4, max_value=256, value=64, step=8)
+            with train_col3:
+                lno_mlp_hidden = st.number_input("Pointwise hidden size", min_value=8, max_value=512, value=128, step=8)
+                lno_train_frac = st.number_input("Train fraction", min_value=0.1, max_value=0.95, value=0.80, step=0.05)
+                lno_weight_decay = st.number_input("Weight decay", min_value=0.0, max_value=1e-2, value=1e-4, format="%.5f")
+
+        train_lno_btn = st.button("Train LNO Model", type="primary", disabled=not (os.path.exists("ic_samples.npy") and os.path.exists("trajectories.npy")))
+
+        if train_lno_btn:
+            # Build hyper-parameters dict
+            hp = {
+                "n_timesteps": int(n_steps) if os.path.exists("trajectories.npy") else 501,
+                "n_species": 2,
+                "train_frac": float(lno_train_frac),
+                "batch_size": int(lno_batch_size),
+                "d_model": int(lno_d_model),
+                "n_lno_blocks": int(lno_blocks),
+                "n_modes": int(lno_modes),
+                "mlp_hidden": int(lno_mlp_hidden),
+                "lifting_layers": 2,
+                "proj_layers": 2,
+                "epochs": int(lno_epochs),
+                "lr": float(lno_lr),
+                "lr_patience": 15,
+                "lr_factor": 0.5,
+                "weight_decay": float(lno_weight_decay),
+                "model_path": "lno_genetic_switch.pt",
+                "plot_path": "lno_prediction_comparison.png",
+                "ic_path": "ic_samples.npy",
+                "traj_path": "trajectories.npy",
             }
-            status_placeholder.success(
-                f"Training complete after {int(pinn_epochs):,} epochs on "
-                f"{device.type.upper()}. Final comparison MSE: {mse_history[-1]:.3e}"
-            )
 
-        elif "pinn_result" in st.session_state:
-            result = st.session_state["pinn_result"]
-            st.info(
-                "Showing the most recent trained PINN. Press **Train PINN** to "
-                "retrain it with the current parameters."
-            )
-            saved_figure = create_live_training_figure(
-                result["epochs"],
-                result["total_losses"],
-                result["ic_losses"],
-                result["physics_losses"],
-                result["t"],
-                result["G"],
-                result["P"],
-                result["G_reference"],
-                result["P_reference"],
-            )
-            st.pyplot(saved_figure)
-            plt.close(saved_figure)
-            st.metric("Final ODE comparison MSE", f"{result['mse_history'][-1]:.3e}")
+            # Setup training UI
+            status_p = st.empty()
+            progress_b = st.progress(0.0)
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            train_loader, test_loader, norm_stats, t_grid = load_lno_data(hp)
+            
+            # Update n_timesteps from loaded data
+            hp["n_timesteps"] = len(t_grid)
+            
+            model = build_lno(hp)
+
+            with st.spinner("Training Laplace Neural Operator..."):
+                train_losses, test_losses = train_lno(
+                    model, train_loader, test_loader, t_grid, hp, device,
+                    status_placeholder=status_p, progress_bar=progress_b
+                )
+                fig_comp = evaluate_lno_and_plot(model, test_loader, t_grid, norm_stats, hp, device)
+                st.session_state["lno_result"] = {
+                    "train_losses": train_losses,
+                    "test_losses": test_losses,
+                    "plot_path": hp["plot_path"]
+                }
+                st.success("LNO training finished and model saved!")
+
+        if "lno_result" in st.session_state:
+            res = st.session_state["lno_result"]
+            st.subheader("LNO Performance and Comparison")
+            if os.path.exists(res["plot_path"]):
+                st.image(res["plot_path"], caption="LNO Prediction vs BDF Ground Truth on Test Sample")
+
+            # Training Curves
+            fig, ax = plt.subplots(figsize=(8, 4))
+            fig.patch.set_facecolor("#0d0d1a")
+            ax.set_facecolor("#12122a")
+            epochs_ax = np.arange(1, len(res["train_losses"]) + 1)
+            ax.semilogy(epochs_ax, res["train_losses"], color="#00e5ff", lw=1.8, label="Train MSE")
+            ax.semilogy(epochs_ax, res["test_losses"],  color="#ff4081", lw=1.8, label="Test  MSE")
+            ax.set_xlabel("Epoch", color="#aaaacc")
+            ax.set_ylabel("MSE Loss (log)", color="#aaaacc")
+            ax.set_title("LNO Training Curves", color="white", fontweight="bold")
+            ax.tick_params(colors="#aaaacc")
+            ax.grid(True, color="#1e1e3a", lw=0.6, ls="--")
+            ax.legend(fontsize=9, facecolor="#12122a", labelcolor="white")
+            for sp in ax.spines.values():
+                sp.set_edgecolor("#2a2a50")
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)

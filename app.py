@@ -83,7 +83,7 @@ with tab1:
     st.header("System Dynamics")
 
     # Build sub-tab names from the solver registry
-    method_names = ["Reference (SciPy)"] + [s.NAME for s in ODE_SOLVERS]
+    method_names = ["Reference (SciPy)", "Book Reference (Schiesser)"] + [s.NAME for s in ODE_SOLVERS]
     method_tabs = st.tabs(method_names)
 
     # --- Reference (SciPy) sub-tab ---
@@ -132,9 +132,105 @@ with tab1:
         else:
             st.error("ODE Solver failed to converge.")
 
+    # --- Book Reference (LSODA — Schiesser Ch. 5) sub-tab ---
+    with method_tabs[1]:
+        st.subheader("LSODA — Schiesser Ch. 5")
+        st.markdown(
+            "The solver used in the original R implementation from *Differential Equation "
+            "Analysis in Biomedical Science and Engineering* (Schiesser, 2014). "
+            "Python's `scipy.integrate.solve_ivp` with `method='LSODA'` is the equivalent "
+            "of R's `lsodes`."
+        )
+
+        book_nout = st.number_input(
+            "Output points", min_value=10, max_value=500, value=26, step=1, key="book_nout",
+            help="The book uses 26 output points (nout=26).",
+        )
+
+        book_t_eval = np.linspace(0, t_end, int(book_nout))
+        book_sol = solve_ivp(
+            ode_system, t_span, [G0, P0],
+            args=(p, n, m), t_eval=book_t_eval,
+            method='LSODA', rtol=1e-8, atol=1e-8,
+        )
+
+        if not book_sol.success:
+            st.error("LSODA solver failed to converge.")
+        else:
+            book_G = book_sol.y[0]
+            book_P = book_sol.y[1]
+
+            # Main plot — same style as other solver tabs
+            fig_bk, ax_bk = plt.subplots(figsize=(10, 5))
+            ax_bk.plot(book_t_eval, book_G, label='GATA-1 (G)', color='red', linewidth=2)
+            ax_bk.plot(book_t_eval, book_P, label='PU.1 (P)', color='blue', linewidth=2)
+            if sol.success:
+                ax_bk.plot(sol.t, sol.y[0], 'r--', alpha=0.4, label='G ref (SciPy)')
+                ax_bk.plot(sol.t, sol.y[1], 'b--', alpha=0.4, label='P ref (SciPy)')
+            ax_bk.set_xlabel('Time')
+            ax_bk.set_ylabel('Concentration')
+            ax_bk.set_title(f'LSODA  ({int(book_nout)} output points)')
+            ax_bk.legend()
+            ax_bk.grid(True)
+            st.pyplot(fig_bk)
+            plt.close(fig_bk)
+
+            # Compute derivatives at each output point (the book's approach)
+            n_pts = len(book_t_eval)
+            book_dG = np.zeros(n_pts)
+            book_dP = np.zeros(n_pts)
+            for j in range(n_pts):
+                derivs = ode_system(book_t_eval[j], [book_G[j], book_P[j]], p, n, m)
+                book_dG[j] = derivs[0]
+                book_dP[j] = derivs[1]
+
+            # 4-panel derivative plot (book's Figure 5.1 layout)
+            st.subheader("Derivative Analysis (Book Layout)")
+            fig_deriv, axes = plt.subplots(2, 2, figsize=(10, 7))
+
+            axes[0, 0].plot(book_t_eval, book_G, 'r-', linewidth=2)
+            axes[0, 0].set_xlabel("t")
+            axes[0, 0].set_ylabel("G(t)")
+            axes[0, 0].set_title("G(t), LSODA")
+            axes[0, 0].grid(True, ls="--", alpha=0.5)
+
+            axes[0, 1].plot(book_t_eval, book_P, 'b-', linewidth=2)
+            axes[0, 1].set_xlabel("t")
+            axes[0, 1].set_ylabel("P(t)")
+            axes[0, 1].set_title("P(t), LSODA")
+            axes[0, 1].grid(True, ls="--", alpha=0.5)
+
+            axes[1, 0].plot(book_t_eval, book_dG, 'r-', linewidth=2)
+            axes[1, 0].set_xlabel("t")
+            axes[1, 0].set_ylabel("dG(t)/dt")
+            axes[1, 0].set_title("dG(t)/dt")
+            axes[1, 0].grid(True, ls="--", alpha=0.5)
+
+            axes[1, 1].plot(book_t_eval, book_dP, 'b-', linewidth=2)
+            axes[1, 1].set_xlabel("t")
+            axes[1, 1].set_ylabel("dP(t)/dt")
+            axes[1, 1].set_title("dP(t)/dt")
+            axes[1, 1].grid(True, ls="--", alpha=0.5)
+
+            fig_deriv.tight_layout()
+            st.pyplot(fig_deriv)
+            plt.close(fig_deriv)
+
+            # Tabular output
+            with st.expander("Numerical Table", expanded=False):
+                table_data = {
+                    "t":      [f"{t:.2f}" for t in book_t_eval],
+                    "G":      [f"{g:.3f}" for g in book_G],
+                    "P":      [f"{pp:.3f}" for pp in book_P],
+                    "dG/dt":  [f"{dg:.3f}" for dg in book_dG],
+                    "dP/dt":  [f"{dp:.3f}" for dp in book_dP],
+                }
+                st.dataframe(pd.DataFrame(table_data), use_container_width=True, hide_index=True)
+
+
     # --- ODE method sub-tabs (driven by registry) ---
     for idx, solver_mod in enumerate(ODE_SOLVERS):
-        with method_tabs[idx + 1]:
+        with method_tabs[idx + 2]:
             st.subheader(solver_mod.NAME)
             st.markdown(solver_mod.DESCRIPTION)
 

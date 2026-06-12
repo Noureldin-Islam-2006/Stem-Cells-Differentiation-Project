@@ -9,6 +9,7 @@ import torch
 # --- Solver Imports ---
 from solvers.core import ode_system, calculate_terms
 from solvers.numerical.newton import solve_newton
+from solvers.numerical.registry import ODE_SOLVERS
 from solvers.ml.pinn import (
     PINN,
     calculate_pinn_loss,
@@ -60,59 +61,103 @@ G0 = st.sidebar.number_input("Initial GATA-1 (G0)", value=0.0, format="%.3f")
 P0 = st.sidebar.number_input("Initial PU.1 (P0)", value=0.0, format="%.3f")
 t_end = st.sidebar.number_input("Time Span (t_end)", value=100.0, format="%.1f")
 
+# 2. Reference solution (used by multiple tabs)
+t_span = (0, t_end)
+t_eval = np.linspace(0, t_end, max(1000, int(t_end*10)))
+sol = solve_ivp(ode_system, t_span, [G0, P0], args=(p, n, m), t_eval=t_eval, method='LSODA')
+
 # 2. Main Panel (Tabs)
 tab1, tab2, tab3, tab4 = st.tabs(["System Dynamics", "Phase Plane & Steady States", "Convergence Analysis", "Machine Learning"])
 
 with tab1:
-    st.header("System Dynamics (ODE Solver)")
-    
-    t_span = (0, t_end)
-    t_eval = np.linspace(0, t_end, max(1000, int(t_end*10)))
-    sol = solve_ivp(ode_system, t_span, [G0, P0], args=(p, n, m), t_eval=t_eval, method='LSODA')
-    
-    if sol.success:
-        fig1, ax1 = plt.subplots(figsize=(10, 5))
-        ax1.plot(sol.t, sol.y[0], label='GATA-1 (G)', color='red', linewidth=2)
-        ax1.plot(sol.t, sol.y[1], label='PU.1 (P)', color='blue', linewidth=2)
-        ax1.set_xlabel('Time')
-        ax1.set_ylabel('Concentration')
-        ax1.set_title('Protein Concentrations over Time')
-        ax1.legend()
-        ax1.grid(True)
-        st.pyplot(fig1)
-        
-        # Breakdown into component terms
-        g1, g2, g3, p1, p2, p3 = calculate_terms(sol.y[0], sol.y[1], p, n, m)
-        
-        st.subheader("Component Breakdown")
-        col1, col2 = st.columns(2)
-        with col1:
-            fig2, ax2 = plt.subplots(figsize=(6, 4))
-            ax2.plot(sol.t, g1, label='Auto-activation', color='darkred', linestyle='--')
-            ax2.plot(sol.t, g2, label='Basal/Cross-inhibition', color='salmon', linestyle='-.')
-            ax2.plot(sol.t, g3, label='Degradation', color='black', linestyle=':')
-            ax2.plot(sol.t, g1+g2+g3, label='Net dG/dt', color='red', linewidth=2)
-            ax2.set_xlabel('Time')
-            ax2.set_ylabel('Rate')
-            ax2.set_title('GATA-1 Rate Terms')
-            ax2.legend()
-            ax2.grid(True)
-            st.pyplot(fig2)
+    st.header("System Dynamics")
+
+    # Build sub-tab names from the solver registry
+    method_names = ["Reference (SciPy)"] + [s.NAME for s in ODE_SOLVERS]
+    method_tabs = st.tabs(method_names)
+
+    # --- Reference (SciPy) sub-tab ---
+    with method_tabs[0]:
+        if sol.success:
+            fig1, ax1 = plt.subplots(figsize=(10, 5))
+            ax1.plot(sol.t, sol.y[0], label='GATA-1 (G)', color='red', linewidth=2)
+            ax1.plot(sol.t, sol.y[1], label='PU.1 (P)', color='blue', linewidth=2)
+            ax1.set_xlabel('Time')
+            ax1.set_ylabel('Concentration')
+            ax1.set_title('Protein Concentrations over Time (SciPy LSODA)')
+            ax1.legend()
+            ax1.grid(True)
+            st.pyplot(fig1)
             
-        with col2:
-            fig3, ax3 = plt.subplots(figsize=(6, 4))
-            ax3.plot(sol.t, p1, label='Auto-activation', color='darkblue', linestyle='--')
-            ax3.plot(sol.t, p2, label='Basal/Cross-inhibition', color='lightblue', linestyle='-.')
-            ax3.plot(sol.t, p3, label='Degradation', color='black', linestyle=':')
-            ax3.plot(sol.t, p1+p2+p3, label='Net dP/dt', color='blue', linewidth=2)
-            ax3.set_xlabel('Time')
-            ax3.set_ylabel('Rate')
-            ax3.set_title('PU.1 Rate Terms')
-            ax3.legend()
-            ax3.grid(True)
-            st.pyplot(fig3)
-    else:
-        st.error("ODE Solver failed to converge.")
+            g1, g2, g3, p1, p2, p3 = calculate_terms(sol.y[0], sol.y[1], p, n, m)
+            st.subheader("Component Breakdown")
+            col1, col2 = st.columns(2)
+            with col1:
+                fig2, ax2 = plt.subplots(figsize=(6, 4))
+                ax2.plot(sol.t, g1, label='Auto-activation', color='darkred', linestyle='--')
+                ax2.plot(sol.t, g2, label='Basal/Cross-inhibition', color='salmon', linestyle='-.')
+                ax2.plot(sol.t, g3, label='Degradation', color='black', linestyle=':')
+                ax2.plot(sol.t, g1+g2+g3, label='Net dG/dt', color='red', linewidth=2)
+                ax2.set_xlabel('Time')
+                ax2.set_ylabel('Rate')
+                ax2.set_title('GATA-1 Rate Terms')
+                ax2.legend()
+                ax2.grid(True)
+                st.pyplot(fig2)
+                
+            with col2:
+                fig3, ax3 = plt.subplots(figsize=(6, 4))
+                ax3.plot(sol.t, p1, label='Auto-activation', color='darkblue', linestyle='--')
+                ax3.plot(sol.t, p2, label='Basal/Cross-inhibition', color='lightblue', linestyle='-.')
+                ax3.plot(sol.t, p3, label='Degradation', color='black', linestyle=':')
+                ax3.plot(sol.t, p1+p2+p3, label='Net dP/dt', color='blue', linewidth=2)
+                ax3.set_xlabel('Time')
+                ax3.set_ylabel('Rate')
+                ax3.set_title('PU.1 Rate Terms')
+                ax3.legend()
+                ax3.grid(True)
+                st.pyplot(fig3)
+        else:
+            st.error("ODE Solver failed to converge.")
+
+    # --- ODE method sub-tabs (driven by registry) ---
+    for idx, solver_mod in enumerate(ODE_SOLVERS):
+        with method_tabs[idx + 1]:
+            st.subheader(solver_mod.NAME)
+            st.markdown(solver_mod.DESCRIPTION)
+
+            if not solver_mod.IS_IMPLEMENTED:
+                st.info(
+                    f"🚧 **{solver_mod.NAME}** is not yet implemented. "
+                    f"Implement it in `solvers/numerical/{solver_mod.KEY}/solver.py`."
+                )
+            else:
+                solver_dt = st.number_input(
+                    "Step size (dt)",
+                    min_value=0.001,
+                    max_value=float(t_end),
+                    value=min(0.1, float(t_end) / 10),
+                    format="%.4f",
+                    key=f"dt_{solver_mod.KEY}",
+                )
+                try:
+                    t_sol, y_sol = solver_mod.solve(
+                        ode_system, t_span, [G0, P0], (p, n, m), solver_dt
+                    )
+                    fig_s, ax_s = plt.subplots(figsize=(10, 5))
+                    ax_s.plot(t_sol, y_sol[0], label='GATA-1 (G)', color='red', linewidth=2)
+                    ax_s.plot(t_sol, y_sol[1], label='PU.1 (P)', color='blue', linewidth=2)
+                    if sol.success:
+                        ax_s.plot(sol.t, sol.y[0], 'r--', alpha=0.4, label='G ref (SciPy)')
+                        ax_s.plot(sol.t, sol.y[1], 'b--', alpha=0.4, label='P ref (SciPy)')
+                    ax_s.set_xlabel('Time')
+                    ax_s.set_ylabel('Concentration')
+                    ax_s.set_title(f'{solver_mod.NAME}  (dt = {solver_dt})')
+                    ax_s.legend()
+                    ax_s.grid(True)
+                    st.pyplot(fig_s)
+                except Exception as exc:
+                    st.error(f"Solver error: {exc}")
 
 with tab2:
     st.header("Phase Plane & Steady States (Newton-Raphson)")
@@ -176,19 +221,92 @@ with tab2:
 
 with tab3:
     st.header("Convergence Analysis")
-    st.markdown("Quadratic convergence visualization using the L2 norm of the Newton-Raphson residual error over iterations on a logarithmic scale.")
     
-    if len(errors) > 0:
-        fig5, ax5 = plt.subplots(figsize=(8, 5))
-        ax5.plot(range(1, len(errors) + 1), errors, 'mo-', linewidth=2)
-        ax5.set_yscale('log')
-        ax5.set_xlabel('Iteration')
-        ax5.set_ylabel('L2 Norm of Error (Log Scale)')
-        ax5.set_title('Newton-Raphson Error Convergence')
-        ax5.grid(True, which="both", ls="--")
-        st.pyplot(fig5)
+    # Build method list: Newton + implemented ODE solvers
+    conv_methods = ["Newton-Raphson"] + [s.NAME for s in ODE_SOLVERS if s.IS_IMPLEMENTED]
+    selected_conv = st.selectbox("Method to analyse", conv_methods, key="conv_method")
+
+    if selected_conv == "Newton-Raphson":
+        st.markdown("Residual L2 norm at each Newton-Raphson iteration (linear scale).")
+        nr_tol = st.number_input("Tolerance", min_value=1e-12, max_value=1.0, value=1e-6, format="%.1e", key="nr_tol")
+        nr_max = st.number_input("Max iterations", min_value=1, max_value=500, value=50, step=1, key="nr_max")
+        with warnings.catch_warnings(record=True) as cw:
+            warnings.simplefilter("always")
+            _, _, nr_errors = solve_newton([G0, P0], p, n, m, tolerance=nr_tol, max_iter=nr_max)
+        for w in cw:
+            st.warning(str(w.message))
+        if len(nr_errors) > 0:
+            fig5, ax5 = plt.subplots(figsize=(8, 5))
+            ax5.plot(range(1, len(nr_errors) + 1), nr_errors, 'mo-', linewidth=2)
+            ax5.set_xlabel('Iteration')
+            ax5.set_ylabel('L2 Norm of Residual')
+            ax5.set_title('Newton-Raphson Iteration Error')
+            ax5.grid(True, ls="--")
+            st.pyplot(fig5)
+        else:
+            st.write("Initial guess is already a root — no iterations needed.")
+
     else:
-        st.write("No iterations were performed (perhaps the initial guess was already a root).")
+        # Find the selected solver module
+        solver_mod = next(s for s in ODE_SOLVERS if s.NAME == selected_conv)
+        st.markdown(f"Error analysis for **{solver_mod.NAME}** against the SciPy LSODA reference.")
+
+        if not sol.success:
+            st.error("Reference solution failed — cannot compute errors.")
+        else:
+            err_col1, err_col2 = st.columns(2)
+
+            # --- Step Size Error ---
+            with err_col1:
+                st.subheader("Step Size Error")
+                ss_min = st.number_input("Min step size", min_value=0.001, value=0.05, format="%.4f", key="ss_min")
+                ss_max = st.number_input("Max step size", min_value=0.01, value=min(5.0, t_end / 2), format="%.4f", key="ss_max")
+                ss_count = st.number_input("Number of step sizes", min_value=2, max_value=50, value=8, step=1, key="ss_count")
+
+                dt_values = np.linspace(ss_min, ss_max, int(ss_count))
+                ss_errors = []
+                for dt_val in dt_values:
+                    try:
+                        t_s, y_s = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(dt_val))
+                        G_interp = np.interp(t_s, sol.t, sol.y[0])
+                        P_interp = np.interp(t_s, sol.t, sol.y[1])
+                        err = np.max(np.sqrt((y_s[0] - G_interp)**2 + (y_s[1] - P_interp)**2))
+                        ss_errors.append(err)
+                    except Exception:
+                        ss_errors.append(np.nan)
+
+                fig_ss, ax_ss = plt.subplots(figsize=(6, 4))
+                ax_ss.plot(dt_values, ss_errors, 'rs-', linewidth=2)
+                ax_ss.set_xlabel('Step Size (h)')
+                ax_ss.set_ylabel('Max L2 Error vs Reference')
+                ax_ss.set_title('Step Size Error')
+                ax_ss.grid(True, ls="--")
+                st.pyplot(fig_ss)
+
+            # --- Iteration (Per-Step) Error ---
+            with err_col2:
+                st.subheader("Iteration Error")
+                iter_dt = st.number_input(
+                    "Step size for per-step analysis",
+                    min_value=0.001, max_value=float(t_end),
+                    value=min(0.1, float(t_end) / 10),
+                    format="%.4f", key="iter_dt",
+                )
+                try:
+                    t_it, y_it = solver_mod.solve(ode_system, t_span, [G0, P0], (p, n, m), float(iter_dt))
+                    G_ref_it = np.interp(t_it, sol.t, sol.y[0])
+                    P_ref_it = np.interp(t_it, sol.t, sol.y[1])
+                    iter_errs = np.sqrt((y_it[0] - G_ref_it)**2 + (y_it[1] - P_ref_it)**2)
+
+                    fig_it, ax_it = plt.subplots(figsize=(6, 4))
+                    ax_it.plot(t_it, iter_errs, 'b-', linewidth=2)
+                    ax_it.set_xlabel('Time')
+                    ax_it.set_ylabel('L2 Error vs Reference')
+                    ax_it.set_title(f'Per-Step Error  (dt = {iter_dt})')
+                    ax_it.grid(True, ls="--")
+                    st.pyplot(fig_it)
+                except Exception as exc:
+                    st.error(f"Solver error: {exc}")
 
 with tab4:
     st.header("Physics-Informed Neural Network")
